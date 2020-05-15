@@ -90,35 +90,33 @@
 
 ; transform output to desired format
 (defn extract-bindings
-  "From a nested map, extract a mapping from all qualified
+  "From a nested map, extract a list of tuples from all qualified
    keywords from the map to a list of the paths to that
-   keyword had get-in been used.
-   The reducer determines how to combine a path-value tuple
-   into the mapping."
-  [query reducer]
+   keyword had get-in been used."
+  [query]
   ; perform tree traversal where each tree node is a tuple of
   ; the path from the root to the current node and the sub-tree
-  (reduce reducer {}
-          (letfn [(val-is-map? [[_ v]] (map? v))
-                  (val-qualified? [[_ v]] (qualified? v))
-                  (unwrap-map [[p m]] (for [[k v] m]
-                                        (if (= k ::as)
-                                          [p v]
-                                          [(conj p k) v])))
-                  (unwrap-vec [[p v]] (for [n v]
-                                        [(conj p ::list) n]))
-                  (unwrap [tuple] (if (val-is-map? tuple)
-                                    (unwrap-map tuple)
-                                    (unwrap-vec tuple)))]
-            (filter val-qualified?
-              (tree-seq val-is-map? unwrap-map [[] query])))))
+  (letfn [(val-is-map? [[_ v]] (map? v))
+          (val-qualified? [[_ v]] (qualified? v))
+          (unwrap-map [[p m]] (for [[k v] m]
+                                (if (= k ::as)
+                                  [p v]
+                                  [(conj p k) v])))
+          (unwrap-vec [[p v]] (for [n v]
+                                [(conj p ::list) n]))
+          (unwrap [tuple] (if (val-is-map? tuple)
+                            (unwrap-map tuple)
+                            (unwrap-vec tuple)))]
+    (filter val-qualified?
+      (tree-seq val-is-map? unwrap-map [[] query]))))
 
 (defn last-bindings
   "A version of binding extraction which, when there are multiple
    instances of the same qualified symbol, will choose the last
    occurance in depth-first order."
   [query]
-  (extract-bindings query (fn [m [p v]] (assoc m v p))))
+  (reduce (fn [m [p v]] (assoc m v p)) {}
+          (extract-bindings query)))
 
 (defn parse-output
   "Intending to be used when binding parameters to query output.
@@ -126,13 +124,82 @@
    symbol is unique. When there are duplicates of the same symbol,
    it throws."
   [query]
-  (extract-bindings query (fn [m [p v]]
-                            (assert (not (contains? m v)))
-                            (assoc m v p))))
+  (reduce (fn [m [p v]]
+            (assert (not (contains? m v)))
+            (assoc m v p))
+          {} (extract-bindings query)))
 
 (defn parse-format
   "Intended to be used when applying bindings to formated output.
-   Extract bindings from a query and keep all paths to all symbols."
+  Extract bindings from a query and keep all paths to all symbols."
   [query]
-  (extract-bindings query (fn [m [p v]]
-                            (assoc m p v))))
+  (extract-bindings query))
+
+
+; conversion between formats
+(defn convert
+  "Given the parsed mapping for two formats, convert the data
+  from one format to another.
+  in   - expected to be produced by parse-output
+  out  - expected to be produced by parse-format
+  data - expected to conform to the shape of in"
+  [in out data]
+  ; use list to represent a stack
+  (loop [processed (list (list))          ; elements converted
+         waiting (list (into (list) out)) ; elements not converted
+         colls   (list (empty out))]      ; shape of containers
+    (let [[cur-wait           & rest-wait] waiting
+          [cur-elem           & rest-elem] cur-wait
+          [cur-proc next-proc & rest-proc] processed]
+      (cond
+        (empty? cur-wait)
+        (cond
+          ; all elements processed, exit func
+          (nil? rest-wait) (into (peek colls) cur-proc)
+
+          (= :map-entry (peek colls))
+          (recur (->> cur-proc
+                      (conj next-proc)
+                      (conj rest-proc))
+                 rest-wait
+                 (pop colls))
+
+          ; pop layer from stacks
+          :else (recur (->> cur-proc
+                            (into (peek colls))
+                            (conj next-proc)
+                            (conj rest-proc))
+                       rest-wait
+                       (pop colls)))
+
+        (map? (peek colls)) (recur (conj processed [])
+                                   ; move first entry in current
+                                   ; map into a stack layer
+                                   ; of its own
+                                   (conj (conj rest-wait
+                                               rest-elem)
+                                         cur-elem)
+                                   (conj colls :map-entry))
+
+        (map? cur-elem) (recur (conj processed (list))
+                               (conj (conj rest-wait rest-elem)
+                                     (seq cur-elem))
+                               (conj colls {}))
+
+        ; convert one element, move it
+        ; from waiting to processed, recur
+        (qualified? cur-elem)
+        (recur (->> (in cur-elem)
+                    (get-in data)
+                    (conj cur-proc)
+                    (conj (pop processed)))
+               (conj rest-wait rest-elem)
+               colls)
+
+        ; move one element from waiting to processed
+        ; without making any conversion
+        :else (recur (->> cur-elem
+                          (conj cur-proc)
+                          (conj (pop processed)))
+                     (conj rest-wait rest-elem)
+                     colls)))))

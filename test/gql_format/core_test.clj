@@ -2,6 +2,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [gql-format.core :as gf]))
 
+(set! *warn-on-reflection* true)
+(set! *unchecked-math* :warn-on-boxed)
+
 ; qualify tests
 (deftest simple-qualifier
   (testing "qualify a simgle symbol"
@@ -99,12 +102,36 @@
                                        "field2" ?val1})))
              (catch AssertionError _ true)))))
 
-(deftest all-symbol-instances
-  (testing "parse format extracts all instances of all symbols"
-    (is (= (gf/parse-format (gf/qualify
-                              {"field1" ?val1
-                               "field2" {"field3" ?val1
-                                         "field4" ?val2}}))
-           {["field1"] ::gf/val1
-            ["field2" "field3"] ::gf/val1
-            ["field2" "field4"] ::gf/val2}))))
+(deftest convert-flat-map
+  (testing "convert flat data from flat format to flat format"
+    (is (= (gf/convert (-> {"field1" ?val1
+                            "field2" ?val2}
+                           gf/qualify
+                           gf/parse-output)
+                       (gf/qualify {?val1 ?val2})
+                       {"field1" 1
+                        "field2" 2})
+           {1 2}))))
+
+(deftest convert-nested-data
+  (testing "convert nested data to a flat format"
+    (is (= (gf/convert (-> {"field1" ?val1
+                            "field2" {"field3" ?val2}}
+                           gf/qualify
+                           gf/parse-output)
+                       (gf/qualify {?val1 ?val2})
+                       {"field1" 1
+                        "field2" {"field3" 2}})
+           {1 2}))))
+
+(deftest convert-nested-format
+  (testing "convert nested data to a nested format"
+    (is (= (gf/convert (-> {"field1" ?val1
+                            "field2" {"field3" ?val2}}
+                           gf/qualify
+                           gf/parse-output)
+                       (gf/qualify {:a ?val1
+                                    :b {:c ?val2}})
+                       {"field1" 1
+                        "field2" {"field3" 2}})
+           {:a 1 :b {:c 2}}))))
