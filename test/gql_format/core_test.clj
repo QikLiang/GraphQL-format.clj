@@ -68,6 +68,7 @@
                                    "field2" ?val}]}))
            "{field1{field2}}"))))
 
+; extract bindings tests
 (deftest extract-flat-map
   (testing "extract qualified symbols from a flat map"
     (is (= (gf/last-bindings (gf/qualify
@@ -83,6 +84,14 @@
                                 "field2" {"field3" ?val2}}))
            {::gf/val1 ["field1"]
             ::gf/val2 ["field2" "field3"]}))))
+
+(deftest extract-list-param
+  (testing "extract qualified symbol within a vector"
+    (is (= (gf/last-bindings (gf/qualify
+                               {"field1" ?val1
+                                "field2" [?val2]}))
+           {::gf/val1 ["field1"]
+            ::gf/val2 ["field2" ::gf/list]}))))
 
 (deftest extract-as-symbol
   (testing "extract qualified symbols from a nested map with ?as"
@@ -135,3 +144,11 @@
                        {"field1" 1
                         "field2" {"field3" 2}})
            {:a 1 :b {:c 2}}))))
+
+(deftest convert-list-binding
+  (testing "convert data containing list binding"
+    (is (= (-> {"f1" ?v1 "f2" [?v2]}
+               gf/qualify gf/parse-output
+               (gf/convert (gf/qualify [?for [?v2] ?v2])
+                           {"f1" 1 "f2" [2 3 4]}))
+           [2 3 4]))))

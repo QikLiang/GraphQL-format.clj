@@ -97,6 +97,8 @@
   ; perform tree traversal where each tree node is a tuple of
   ; the path from the root to the current node and the sub-tree
   (letfn [(val-is-map? [[_ v]] (map? v))
+          (val-is-vec? [[_ v]] (vector? v))
+          (val-is-coll? [[_ v]] (coll? v))
           (val-qualified? [[_ v]] (qualified? v))
           (unwrap-map [[p m]] (for [[k v] m]
                                 (if (= k ::as)
@@ -104,11 +106,12 @@
                                   [(conj p k) v])))
           (unwrap-vec [[p v]] (for [n v]
                                 [(conj p ::list) n]))
-          (unwrap [tuple] (if (val-is-map? tuple)
+          (unwrap [tuple] (cond (val-is-map? tuple)
                             (unwrap-map tuple)
+                            (val-is-vec? tuple)
                             (unwrap-vec tuple)))]
     (filter val-qualified?
-      (tree-seq val-is-map? unwrap-map [[] query]))))
+      (tree-seq val-is-coll? unwrap [[] query]))))
 
 (defn last-bindings
   "A version of binding extraction which, when there are multiple
@@ -129,72 +132,165 @@
             (assoc m v p))
           {} (extract-bindings query)))
 
-(defn parse-format
-  "Intended to be used when applying bindings to formated output.
-  Extract bindings from a query and keep all paths to all symbols."
-  [query]
-  (extract-bindings query))
+(defn- split-list [path]
+  (loop [chunks []
+         subpath path]
+    (let [[path-chunk path-rest]
+          (split-with (complement #{::list}) subpath)
+          rest-path (rest path-rest)]
+      (cond
+        (empty? path-rest) (conj chunks path-chunk)
+        (empty? rest-path) (conj (conj chunks path-chunk) (list))
+        :else (recur (conj chunks path-chunk) rest-path)))))
 
+(defn- bind-list-params
+  [in-format params bindings init-depth]
+  (loop [[[len to-list post-list :as paths]
+          & rest-paths :as all-paths]
+         (->> (select-keys in-format params)
+              (map #(update % 1 split-list))
+              (group-by #(count (second %)))
+              (map (fn [[len paths]]
+                     [len
+                      ; part before the last ::list
+                      ; first instead of map because
+                      ; they should all be the same
+                      (pop (second (first paths)))
+                      ; part after the last ::list
+                      (map #(update % 1 peek) paths)]))
+              (sort-by first))
+         depth init-depth
+         results [bindings]]
+    (cond
+      (empty? paths) [depth results]
+
+      (< (inc depth) len)
+      (recur all-paths (inc depth)
+             (mapcat (fn [result]
+                       (for [new-data (get-in
+                                        (:data result)
+                                        (to-list depth))]
+                         (assoc result :data new-data)))
+                     results))
+
+      :else
+      (recur rest-paths depth
+             (for [result results]
+               (into result
+                     (for [[param path] post-list]
+                       [param
+                        (get-in (:data result) path)])))))))
 
 ; conversion between formats
 (defn convert
   "Given the parsed mapping for two formats, convert the data
   from one format to another.
-  in   - expected to be produced by parse-output
-  out  - expected to be produced by parse-format
-  data - expected to conform to the shape of in"
-  [in out data]
+  in-format  - expected to be produced by parse-output
+  out-format - format of desired output
+  data       - expected to conform to the shape of in"
+  [in-format out-format data]
   ; use list to represent a stack
   (loop [processed (list (list))          ; elements converted
-         waiting (list (into (list) out)) ; elements not converted
-         colls   (list (empty out))]      ; shape of containers
+         waiting (list (list out-format)) ; elements not converted
+         colls   (list (list))            ; shape of containers
+         bindings (->> (for [[param path] in-format]
+                         [param (get-in data path)])
+                       (into {:data data})
+                       list list)
+         list-iter-depth 0]
     (let [[cur-wait           & rest-wait] waiting
           [cur-elem           & rest-elem] cur-wait
           [cur-proc next-proc & rest-proc] processed]
       (cond
+        (empty? (first bindings))
+        (recur (->> cur-proc
+                    (into (second colls))
+                    (conj next-proc)
+                    (conj rest-proc))
+               (conj (pop rest-wait)
+                     (rest (peek rest-wait)))
+               (pop (pop colls))
+               (pop bindings)
+               list-iter-depth)
+
         (empty? cur-wait)
         (cond
           ; all elements processed, exit func
-          (nil? rest-wait) (into (peek colls) cur-proc)
+          (nil? rest-wait) (first cur-proc)
 
           (= :map-entry (peek colls))
           (recur (->> cur-proc
                       (conj next-proc)
                       (conj rest-proc))
                  rest-wait
-                 (pop colls))
+                 (pop colls)
+                 bindings
+                 list-iter-depth)
 
+          (= :bindings (peek colls))
+          (recur processed
+                 (conj rest-wait
+                       (list (nth (first (peek rest-wait)) 2)))
+                 colls
+                 (conj (pop bindings) (rest (peek bindings)))
+                 list-iter-depth)
+
+          :else
           ; pop layer from stacks
-          :else (recur (->> cur-proc
-                            (into (peek colls))
-                            (conj next-proc)
-                            (conj rest-proc))
-                       rest-wait
-                       (pop colls)))
+          (recur (->> cur-proc
+                      (into (peek colls))
+                      (conj next-proc)
+                      (conj rest-proc))
+                 rest-wait
+                 (pop colls)
+                 bindings
+                 list-iter-depth))
 
-        (map? (peek colls)) (recur (conj processed [])
-                                   ; move first entry in current
-                                   ; map into a stack layer
-                                   ; of its own
-                                   (conj (conj rest-wait
-                                               rest-elem)
-                                         cur-elem)
-                                   (conj colls :map-entry))
+        (map? (peek colls))
+        ; move first entry in current
+        ; map into a stack layer of its own
+        (recur (conj processed [])
+               (conj (conj rest-wait rest-elem) cur-elem)
+               (conj colls :map-entry)
+               bindings
+               list-iter-depth)
 
-        (map? cur-elem) (recur (conj processed (list))
-                               (conj (conj rest-wait rest-elem)
-                                     (seq cur-elem))
-                               (conj colls {}))
+        (map? cur-elem)
+        ; move map entries into its own stack layer
+        (recur (conj processed (list))
+               (conj (conj rest-wait rest-elem) (seq cur-elem))
+               (conj colls {})
+               bindings
+               list-iter-depth)
+
+        (sequential? cur-elem)
+        (if (= ::for (first cur-elem))
+          (let [[new-depth new-bindings]
+                (bind-list-params in-format (second cur-elem)
+                                  (first (first bindings))
+                                  list-iter-depth)]
+            (recur (conj processed [])
+                   ; keep cur-elem unprocessed so it can be reused
+                   (conj waiting (list (nth cur-elem 2)))
+                   (conj (conj colls (empty cur-elem)) :bindings)
+                   (conj bindings new-bindings)
+                   new-depth))
+          (recur (conj processed (list))
+                 (conj (conj rest-wait rest-elem) cur-elem)
+                 (conj colls (empty cur-elem))
+                 bindings
+                 list-iter-depth))
 
         ; convert one element, move it
         ; from waiting to processed, recur
         (qualified? cur-elem)
-        (recur (->> (in cur-elem)
-                    (get-in data)
+        (recur (->> ((first (first bindings)) cur-elem)
                     (conj cur-proc)
                     (conj (pop processed)))
                (conj rest-wait rest-elem)
-               colls)
+               colls
+               bindings
+               list-iter-depth)
 
         ; move one element from waiting to processed
         ; without making any conversion
@@ -202,4 +298,6 @@
                           (conj cur-proc)
                           (conj (pop processed)))
                      (conj rest-wait rest-elem)
-                     colls)))))
+                     colls
+                     bindings
+                     list-iter-depth)))))
