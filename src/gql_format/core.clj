@@ -40,65 +40,80 @@
       (symbol $))
     obj))
 
+(defn quote
+  "Since both GraphQL and Clojure use double-quotes for strings,
+   this helper function surrounds text with double-quotes."
+  [text]
+  (str \" text \"))
+
+(defn- build-query-fields
+  "take a mapping of fields to converted text and
+   join them to form a block"
+  [fields]
+  (str \{
+       (str/join " " (for [[k v] fields]
+                       (str k (first v) (second v))))
+       \}))
+
+(defn- build-query-params
+  "take a list of key value pairs of GraphQL
+   field arguments and join them"
+  [params]
+  (if (empty? params) ""
+    (str \(
+         (str/join ", "
+                   (for [[k v] params
+                         :when (not (qualified? k))]
+                     (str (name k) ": " v)))
+         \))))
+
+(defn- build-query-map
+  "separate a map into arguments and fields,
+   convert them separately, and return a tuple"
+  [m]
+  (let [keywords (group-by #(keyword? (first %))
+                           (dissoc m ::as))]
+    (list
+      (build-query-params (keywords true))
+      (build-query-fields (keywords false)))))
+
+(defn- build-query-vec
+  "treat the first 2N elements such that the even
+   indices are keywords as argument key value pairs,
+   return a tuple of the converted arguments and
+   the 2N+1th element. Assume 2N+1th element is
+   output from convert with no arguments"
+  [v]
+  (loop [vnext v
+         args []]
+    (cond
+      (= (first vnext) ::as)
+      (recur (drop 2 vnext) args)
+
+      (keyword? (first vnext))
+      (recur (drop 2 vnext) (conj args (take 2 vnext)))
+
+      :else
+      (list (build-query-params args) (second (first vnext))))))
+
+(defn- build-subquery
+  "dispatch to the proper build-query-* based on type"
+  [obj]
+  (cond
+    (map? obj) (build-query-map obj)
+    (= obj ::as) obj
+    (qualified? obj) (list "" "")
+    (map-entry? obj) obj
+    (vector? obj) (build-query-vec obj)
+    :else obj))
+
 (defn build
   "build a GraphQL query string using the expected output shape"
   [output]
-  (letfn [(convert-fields [fields]
-            ; take a mapping of fields to converted text and
-            ; join them to form a block
-            (str "{"
-                 (str/join " " (for [[k v] fields]
-                                 (str k (first v) (second v))))
-                 "}"))
-          (convert-params [ps]
-            ; take a list of key value pairs of GraphQL
-            ; field arguments and join them
-            (if (empty? ps) ""
-              (str "("
-                   (str/join ", "
-                             (for [[k v] ps
-                                   :when (not (qualified? k))]
-                               (str (name k) ": " v)))
-                   ")")))
-          (convert-map [m]
-            ; separate a map into arguments and fields,
-            ; convert them separately, and return a tuple
-            (let [keywords (group-by #(keyword? (first %))
-                                     (dissoc m ::as))]
-              (list
-                (convert-params (keywords true))
-                (convert-fields (keywords false)))))
-          (convert-vec [v]
-            ; treat the first 2N elements such that the even
-            ; indices are keywords as argument key value pairs,
-            ; return a tuple of the converted arguments and
-            ; the 2N+1th element. Assume 2N+1th element is
-            ; output from convert with no arguments
-            (loop [vnext v
-                   args []]
-              (cond
-                (= (first vnext) ::as)
-                (recur (drop 2 vnext) args)
-
-                (keyword? (first vnext))
-                (recur (drop 2 vnext) (conj args (take 2 vnext)))
-
-                :else
-                (list (convert-params args) (second (first vnext))))))
-          ; treat map entries differently than normal vectors
-          (map-entry? [obj]
-            (and (vector? obj) (= 2 (count obj))))
-          ; dispatch to the proper convertor based on data shape
-          (convert [obj]
-            (cond
-              (map? obj) (convert-map obj)
-              (= obj ::as) obj
-              (qualified? obj) (list "" "")
-              (map-entry? obj) obj
-              (vector? obj) (convert-vec obj)
-              :else obj))]
-    ; only return the fields part of the tuple
-    (second (postwalk convert output))))
+  (if (and (map? output) (contains? output "query"))
+    (str "query" (str/join "" (postwalk build-subquery
+                                        (output "query"))))
+    (second (postwalk build-subquery output))))
 
 
 ; transform output to desired format
@@ -127,7 +142,7 @@
     (filter val-qualified?
       (tree-seq val-is-coll? unwrap [[] query]))))
 
-(defn parse-output
+(defn extract-params
   "Intending to be used when binding parameters to query output.
    Extract bindings from a query and asserting that each qualified
    symbol is unique. When there are duplicates of the same symbol,
@@ -141,6 +156,8 @@
 (defn- empty-coll [coll]
   (if (map-entry? coll) [] (empty coll)))
 
+
+; conversion between formats
 (defn- extract-coll-params
   "Detect whether a collection has the form
    [[?for ?v1 ?v2...] shape] and return [(?v1 ?v2 ...) shape].
@@ -180,10 +197,10 @@
    and the existing binding, generate a sequence of new bindings
    such that the parameters are binded to each possible
    combination of values."
-  [in-format params bindings]
+  [params-loc params bindings]
   (loop [[[len to-list post-list :as paths]
           & rest-paths :as all-paths]
-         (->> (select-keys in-format params)
+         (->> (select-keys params-loc params)
               (map #(update % 1 split-list))
               (group-by #(count (second %)))
               (map (fn [[len paths]]
@@ -227,14 +244,21 @@
                        [param
                         (get-in (:data result) path ::unbinded)])))))))
 
-; conversion between formats
+(defn- form-binding
+  "construct the initial binding used by convert"
+  [params-loc data]
+  (->> (for [[param path] params-loc]
+         [param (get-in data path ::unbinded)])
+       ; :depth is used in extract-list-bindings
+       (into {:data data :depth 0})))
+
 (defn convert
   "Given the parsed mapping for two formats, convert the data
   from one format to another.
-  in-format  - expected to be produced by parse-output
+  params-loc - expected to be produced by extract-params
   out-format - format of desired output
   data       - expected to conform to the shape of in"
-  [in-format out-format data]
+  [params-loc out-format data]
   ; Perform in-place binding on all qualified parameters in
   ; out-format by performing a recursive tree traversal through
   ; the data structure. Start with a sequence of the unconverted
@@ -249,11 +273,7 @@
   (loop [processed (list (list))
          waiting (list (list out-format))
          colls   (list (list))
-         bindings (->> (for [[param path] in-format]
-                         [param (get-in data path ::unbinded)])
-                       ; :depth is used in extract-list-bindings
-                       (into {:data data :depth 0})
-                       list list)]
+         bindings (list (list (form-binding params-loc data)))]
     (let [[cur-wait           & rest-wait] waiting
           [cur-elem           & rest-elem] cur-wait
           [cur-proc next-proc & rest-proc] processed]
@@ -308,7 +328,7 @@
                  (conj (conj waiting element) element)
                  (conj (conj colls (empty cur-elem)) :bindings)
                  (conj bindings (extract-list-bindings
-                                  in-format
+                                  params-loc
                                   coll-params
                                   (first (first bindings)))))))
 
@@ -330,3 +350,11 @@
                      (conj rest-wait rest-elem)
                      colls
                      bindings)))))
+
+(defmacro precompile
+  "Evaluate query building and parameters extraction at compile time.
+   Return [(build (qualify query))
+           (extract-params (qualify query))]."
+  [query]
+  (let [q (qualify query)]
+    [(build q) (extract-params q)]))
