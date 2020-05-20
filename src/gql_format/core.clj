@@ -5,27 +5,40 @@
 ; prefix namespace used to ensure keywords are unique
 (def prefix (str (ns-name *ns*)))
 
+(defn qualify-kw
+  "Convert a symbol in the form ?param into a keyword of the
+   form :gql-format.core/param."
+  [obj]
+  (if (and (symbol? obj)
+           (= \? (first (name obj))))
+    (as-> obj $
+      (name $)
+      (subs $ 1)
+      (str prefix "/" $)
+      (keyword $))
+    obj))
+
 (defmacro qualify
-  "recursively find all symbols of the form ?param and convert
-   them into the form :gql-format.core/param"
+  "Recursively call qualify-kw on all values in a data structure."
   [query]
-  (letfn [(convert [sym]
-            (as-> sym $
-              (name $)
-              (subs $ 1)
-              (str prefix "/" $)
-              (keyword $)))
-          (check-convert [obj]
-            (if (and (symbol? obj)
-                     (= \? (first (name obj))))
-              (convert obj)
-              obj))]
-    (postwalk check-convert query)))
+  (postwalk qualify-kw query))
 
 (defn qualified?
-  "check if value matches the format of the output of qualify"
+  "check if value matches the format of the output of qualify-kw"
   [value]
   (and (keyword? value) (= prefix (namespace value))))
+
+(defn dequalify-kw
+  "The inverse function of qualify-kw"
+  [obj]
+  (if (qualified? obj)
+    (as-> obj $
+      (name $)
+      (str/split $ #"/")
+      (last $)
+      (str "?" $)
+      (symbol $))
+    obj))
 
 (defn build
   "build a GraphQL query string using the expected output shape"
@@ -99,7 +112,8 @@
   (letfn [(val-is-map? [[_ v]] (map? v))
           (val-is-vec? [[_ v]] (vector? v))
           (val-is-coll? [[_ v]] (coll? v))
-          (val-qualified? [[_ v]] (qualified? v))
+          (val-qualified? [[_ v]] (and (qualified? v)
+                                       (not= v ::_)))
           (unwrap-map [[p m]] (for [[k v] m]
                                 (if (= k ::as)
                                   [p v]
@@ -113,14 +127,6 @@
     (filter val-qualified?
       (tree-seq val-is-coll? unwrap [[] query]))))
 
-(defn last-bindings
-  "A version of binding extraction which, when there are multiple
-   instances of the same qualified symbol, will choose the last
-   occurance in depth-first order."
-  [query]
-  (reduce (fn [m [p v]] (assoc m v p)) {}
-          (extract-bindings query)))
-
 (defn parse-output
   "Intending to be used when binding parameters to query output.
    Extract bindings from a query and asserting that each qualified
@@ -132,7 +138,33 @@
             (assoc m v p))
           {} (extract-bindings query)))
 
-(defn- split-list [path]
+(defn- empty-coll [coll]
+  (if (map-entry? coll) [] (empty coll)))
+
+(defn- extract-coll-params
+  "Detect whether a collection has the form
+   [[?for ?v1 ?v2...] shape] and return [(?v1 ?v2 ...) shape].
+   Return nil if pattern not match."
+  [coll]
+  (cond
+    (and (sequential? coll)
+         (vector? (first coll))
+         (= ::for (first (first coll))))
+    [(rest (first coll)) (rest coll)]
+
+    (set? coll)
+    (let [is-param (group-by #(and (vector? %)
+                                   (= ::for (first %)))
+                             coll)]
+      [(rest (first (is-param true))) (is-param false)])
+
+    :else nil))
+
+(defn- split-list
+  "Split a sequence using the keyword ::list. To distinguish
+   between [:a :b ::list] and [:a :b], append empty list at the
+   end if the original sequence ends with ::list."
+  [path]
   (loop [chunks []
          subpath path]
     (let [[path-chunk path-rest]
@@ -143,34 +175,48 @@
         (empty? rest-path) (conj (conj chunks path-chunk) (list))
         :else (recur (conj chunks path-chunk) rest-path)))))
 
-(defn- bind-list-params
-  [in-format params bindings init-depth]
+(defn- extract-list-bindings
+  "Given a list of parameters that can bind to multiple values
+   and the existing binding, generate a sequence of new bindings
+   such that the parameters are binded to each possible
+   combination of values."
+  [in-format params bindings]
   (loop [[[len to-list post-list :as paths]
           & rest-paths :as all-paths]
          (->> (select-keys in-format params)
               (map #(update % 1 split-list))
               (group-by #(count (second %)))
               (map (fn [[len paths]]
+                     (assert (apply = (map #(pop (second %))
+                                           paths))
+                             (str "Parameters "
+                                  (map dequalify-kw params)
+                                  " must extract values from the"
+                                  " same collection"))
                      [len
-                      ; part before the last ::list
+                      ; part before the last ::list,
                       ; first instead of map because
                       ; they should all be the same
                       (pop (second (first paths)))
-                      ; part after the last ::list
+                      ; a mapping from parameters to
+                      ; the part after the last ::list
                       (map #(update % 1 peek) paths)]))
               (sort-by first))
-         depth init-depth
+         depth (:depth bindings)
          results [bindings]]
     (cond
-      (empty? paths) [depth results]
+      (empty? paths) results
 
       (< (inc depth) len)
       (recur all-paths (inc depth)
              (mapcat (fn [result]
                        (for [new-data (get-in
                                         (:data result)
-                                        (to-list depth))]
-                         (assoc result :data new-data)))
+                                        (to-list depth)
+                                        ::unbinded)]
+                         (-> result
+                             (assoc :data new-data)
+                             (update :depth inc))))
                      results))
 
       :else
@@ -179,7 +225,7 @@
                (into result
                      (for [[param path] post-list]
                        [param
-                        (get-in (:data result) path)])))))))
+                        (get-in (:data result) path ::unbinded)])))))))
 
 ; conversion between formats
 (defn convert
@@ -189,51 +235,53 @@
   out-format - format of desired output
   data       - expected to conform to the shape of in"
   [in-format out-format data]
-  ; use list to represent a stack
-  (loop [processed (list (list))          ; elements converted
-         waiting (list (list out-format)) ; elements not converted
-         colls   (list (list))            ; shape of containers
+  ; Perform in-place binding on all qualified parameters in
+  ; out-format by performing a recursive tree traversal through
+  ; the data structure. Start with a sequence of the unconverted
+  ; values in waiting, take one out, recursively convert it,
+  ; then put it at the end of processed. When encountering a
+  ; collection, push its contents as a new layer onto the stack
+  ; of waiting values, and remember the type of the collection
+  ; in colls. When all values in a layer is processed, put the
+  ; values back into the same type of collection. Use bindings
+  ; to keep track of the cases where a parameter can bind to
+  ; multiple values.
+  (loop [processed (list (list))
+         waiting (list (list out-format))
+         colls   (list (list))
          bindings (->> (for [[param path] in-format]
-                         [param (get-in data path)])
-                       (into {:data data})
-                       list list)
-         list-iter-depth 0]
+                         [param (get-in data path ::unbinded)])
+                       ; :depth is used in extract-list-bindings
+                       (into {:data data :depth 0})
+                       list list)]
     (let [[cur-wait           & rest-wait] waiting
           [cur-elem           & rest-elem] cur-wait
           [cur-proc next-proc & rest-proc] processed]
       (cond
+        ; when all possible bindings are exausted, pop the layer
+        ; of bindings, append results at the end of previous
+        ; layer's processed
         (empty? (first bindings))
         (recur (->> cur-proc
                     (into (second colls))
                     (conj next-proc)
                     (conj rest-proc))
-               (conj (pop rest-wait)
-                     (rest (peek rest-wait)))
+               (conj (pop (pop rest-wait))
+                     (rest (peek (pop rest-wait))))
                (pop (pop colls))
-               (pop bindings)
-               list-iter-depth)
+               (pop bindings))
 
         (empty? cur-wait)
         (cond
           ; all elements processed, exit func
           (nil? rest-wait) (first cur-proc)
 
-          (= :map-entry (peek colls))
-          (recur (->> cur-proc
-                      (conj next-proc)
-                      (conj rest-proc))
-                 rest-wait
-                 (pop colls)
-                 bindings
-                 list-iter-depth)
-
+          ; pop layer from bindings
           (= :bindings (peek colls))
           (recur processed
-                 (conj rest-wait
-                       (list (nth (first (peek rest-wait)) 2)))
+                 (conj rest-wait (peek rest-wait))
                  colls
-                 (conj (pop bindings) (rest (peek bindings)))
-                 list-iter-depth)
+                 (conj (pop bindings) (rest (peek bindings))))
 
           :else
           ; pop layer from stacks
@@ -243,61 +291,42 @@
                       (conj rest-proc))
                  rest-wait
                  (pop colls)
-                 bindings
-                 list-iter-depth))
+                 bindings))
 
-        (map? (peek colls))
-        ; move first entry in current
-        ; map into a stack layer of its own
-        (recur (conj processed [])
-               (conj (conj rest-wait rest-elem) cur-elem)
-               (conj colls :map-entry)
-               bindings
-               list-iter-depth)
-
-        (map? cur-elem)
-        ; move map entries into its own stack layer
-        (recur (conj processed (list))
-               (conj (conj rest-wait rest-elem) (seq cur-elem))
-               (conj colls {})
-               bindings
-               list-iter-depth)
-
-        (sequential? cur-elem)
-        (if (= ::for (first cur-elem))
-          (let [[new-depth new-bindings]
-                (bind-list-params in-format (second cur-elem)
-                                  (first (first bindings))
-                                  list-iter-depth)]
-            (recur (conj processed [])
-                   ; keep cur-elem unprocessed so it can be reused
-                   (conj waiting (list (nth cur-elem 2)))
-                   (conj (conj colls (empty cur-elem)) :bindings)
-                   (conj bindings new-bindings)
-                   new-depth))
-          (recur (conj processed (list))
-                 (conj (conj rest-wait rest-elem) cur-elem)
-                 (conj colls (empty cur-elem))
-                 bindings
-                 list-iter-depth))
-
-        ; convert one element, move it
-        ; from waiting to processed, recur
-        (qualified? cur-elem)
-        (recur (->> ((first (first bindings)) cur-elem)
-                    (conj cur-proc)
-                    (conj (pop processed)))
-               (conj rest-wait rest-elem)
-               colls
-               bindings
-               list-iter-depth)
+        (coll? cur-elem)
+        (let [[coll-params element]
+              (extract-coll-params cur-elem)]
+        (if (nil? coll-params)
+          (recur (conj processed [])
+                 (conj (conj rest-wait rest-elem)
+                       (seq cur-elem))
+                 (conj colls (empty-coll cur-elem))
+                 bindings)
+          (recur (conj processed [])
+                 ; keep cur-elem unprocessed so it
+                 ; can be reused for multiple bindings
+                 (conj (conj waiting element) element)
+                 (conj (conj colls (empty cur-elem)) :bindings)
+                 (conj bindings (extract-list-bindings
+                                  in-format
+                                  coll-params
+                                  (first (first bindings)))))))
 
         ; move one element from waiting to processed
-        ; without making any conversion
-        :else (recur (->> cur-elem
+        ; bind value if element is qualified param
+        :else (recur (->> (if (qualified? cur-elem)
+                            (let [binded
+                                  (get (first (first bindings))
+                                       cur-elem
+                                       ::unbinded)]
+                              (assert (not= binded ::unbinded)
+                                      (str "Parameter "
+                                           (dequalify-kw cur-elem)
+                                           "unresolved"))
+                              binded)
+                            cur-elem)
                           (conj cur-proc)
                           (conj (pop processed)))
                      (conj rest-wait rest-elem)
                      colls
-                     bindings
-                     list-iter-depth)))))
+                     bindings)))))

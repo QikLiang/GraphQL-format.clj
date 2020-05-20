@@ -71,34 +71,34 @@
 ; extract bindings tests
 (deftest extract-flat-map
   (testing "extract qualified symbols from a flat map"
-    (is (= (gf/last-bindings (gf/qualify
-                               {"field1" ?val1
-                                "field2" ?val2}))
+    (is (= (gf/parse-output (gf/qualify
+                              {"field1" ?val1
+                               "field2" ?val2}))
            {::gf/val1 ["field1"]
             ::gf/val2 ["field2"]}))))
 
 (deftest extract-nested-map
   (testing "extract qualified symbols from a nested map"
-    (is (= (gf/last-bindings (gf/qualify
-                               {"field1" ?val1
-                                "field2" {"field3" ?val2}}))
+    (is (= (gf/parse-output (gf/qualify
+                              {"field1" ?val1
+                               "field2" {"field3" ?val2}}))
            {::gf/val1 ["field1"]
             ::gf/val2 ["field2" "field3"]}))))
 
 (deftest extract-list-param
   (testing "extract qualified symbol within a vector"
-    (is (= (gf/last-bindings (gf/qualify
-                               {"field1" ?val1
-                                "field2" [?val2]}))
+    (is (= (gf/parse-output (gf/qualify
+                              {"field1" ?val1
+                               "field2" [?val2]}))
            {::gf/val1 ["field1"]
             ::gf/val2 ["field2" ::gf/list]}))))
 
 (deftest extract-as-symbol
   (testing "extract qualified symbols from a nested map with ?as"
-    (is (= (gf/last-bindings (gf/qualify
-                               {"field1" ?val1
-                                "field2" {?as ?val2
-                                          "field3" ?val3}}))
+    (is (= (gf/parse-output (gf/qualify
+                              {"field1" ?val1
+                               "field2" {?as ?val2
+                                         "field3" ?val3}}))
            {::gf/val1 ["field1"]
             ::gf/val2 ["field2"]
             ::gf/val3 ["field2" "field3"]}))))
@@ -145,10 +145,85 @@
                         "field2" {"field3" 2}})
            {:a 1 :b {:c 2}}))))
 
+(deftest convert-detect-unbinded-param
+  (testing "convert format should contain no unbinded parameter"
+    (is (try (nil? (-> {"field1" ?v1}
+                       gf/qualify gf/parse-output
+                       (gf/convert
+                         (gf/qualify ?v2)
+                         {"field1" 1})))
+             (catch AssertionError _ true)))))
+
 (deftest convert-list-binding
-  (testing "convert data containing list binding"
-    (is (= (-> {"f1" ?v1 "f2" [?v2]}
+  (testing "convert to a vector container"
+    (is (= (-> {"field1" ?v1 "field2" [?v2]}
                gf/qualify gf/parse-output
-               (gf/convert (gf/qualify [?for [?v2] ?v2])
-                           {"f1" 1 "f2" [2 3 4]}))
+               (gf/convert (gf/qualify [[?for ?v2] ?v2])
+                           {"field1" 1
+                            "field2" [2 3 4]}))
            [2 3 4]))))
+
+(deftest convert-list-iterative-binding
+  (testing "convert parameter binded to multiple values"
+    (is (= (-> {"field1" ?v1
+                "field2" [?v2]}
+               gf/qualify gf/parse-output
+               (gf/convert (gf/qualify [[?for ?v2] ?v2])
+                           {"field1" 1
+                            "field2" [2 3 4]}))
+           [2 3 4]))))
+
+(deftest convert-list-iterative-multiple-binding
+  (testing "convert with multiple parameters binded to multiple values"
+    (is (= (-> {"field1" ?v1
+                "field2" [?v2]}
+               gf/qualify gf/parse-output
+               (gf/convert (gf/qualify [[?for ?v2] ?v1 ?v2])
+                           {"field1" 1
+                            "field2" [2 3 4]}))
+           [1 2 1 3 1 4]))))
+
+(deftest convert-iterative-binding-detect-error
+  (testing (str "Assert error when parameters in the same "
+                "collection bind to values originally from "
+                "different lists")
+    (is (try (nil? (-> {"field1" [?v1]
+                        "field2" [?v2]}
+                       gf/qualify gf/parse-output
+                       (gf/convert
+                         (gf/qualify [[?for ?v1 ?v2] ?v1 ?v2])
+                         {"field1" [1 2 3]
+                          "field2" [2 3 4]})))
+             (catch AssertionError _ true)))))
+
+(deftest convert-set-iterative-binding
+  (testing "bind multiple values to a set"
+    (is (= (-> {"field1" ?v1
+                "field2" [?v2]}
+               gf/qualify gf/parse-output
+               (gf/convert (gf/qualify #{[?for ?v2] ?v2})
+                           {"field1" 1
+                            "field2" [2 3 4]}))
+           #{2 3 4}))))
+
+(deftest convert-nested-list-iterative-binding
+  (testing "convert parameter binded to multiple values"
+    (is (= (-> {"field1" ?v1
+                "field2" [{"list" ?v2
+                           "sublist" [?v3]}]}
+               gf/qualify gf/parse-output
+               (gf/convert (gf/qualify [[?for ?v2]
+                                        {?v2 [[?for ?v3] ?v3]}])
+                           {"field1" 1
+                            "field2" [{"list" "cat1"
+                                       "sublist" ["subcat1"
+                                                  "subcat2"]}
+                                      {"list" "cat2"
+                                       "sublist" ["subcat1"
+                                                  "subcat2"]}
+                                      {"list" "cat3"
+                                       "sublist" ["subcat1"
+                                                  "subcat2"]}]}))
+           [{"cat1" ["subcat1" "subcat2"]}
+            {"cat2" ["subcat1" "subcat2"]}
+            {"cat3" ["subcat1" "subcat2"]}]))))
