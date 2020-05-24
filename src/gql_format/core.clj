@@ -1,11 +1,11 @@
 (ns gql-format.core
-  (:require [clojure.walk :refer [postwalk]]
+  (:require [clojure.walk :refer [postwalk postwalk-replace]]
             [clojure.string :as str]))
 
 ; prefix namespace used to ensure keywords are unique
 (def prefix (str (ns-name *ns*)))
 
-(defn qualify-kw
+(defn- qualify-kw
   "Convert a symbol in the form ?param into a keyword of the
    form :gql-format.core/param."
   [obj]
@@ -23,12 +23,12 @@
   [query]
   (postwalk qualify-kw query))
 
-(defn qualified?
+(defn- qualified?
   "check if value matches the format of the output of qualify-kw"
   [value]
   (and (keyword? value) (= prefix (namespace value))))
 
-(defn dequalify-kw
+(defn- dequalify-kw
   "The inverse function of qualify-kw"
   [obj]
   (if (qualified? obj)
@@ -117,28 +117,63 @@
 
 
 ; transform output to desired format
+(defn- extract-coll-params
+  "Detect whether a collection has the form
+   [[?for ?v1 ?v2...] shape] and return [(?v1 ?v2 ...) shape].
+   Return nil if pattern not match."
+  [coll]
+  (cond
+    (and (sequential? coll)
+         (vector? (first coll))
+         (= ::for (first (first coll))))
+    [(rest (first coll)) (into (empty coll) (rest coll))]
+
+    (and (map? coll)
+         (contains? coll ::for))
+    [(::for coll) (dissoc coll ::for)]
+
+    (set? coll)
+    (let [is-param (group-by #(and (vector? %)
+                                   (= ::for (first %)))
+                             coll)]
+      [(rest (first (is-param true)))
+       (apply disj (is-param false))])
+
+    :else nil))
+
 (defn extract-bindings
   "From a nested map, extract a list of tuples from all qualified
    keywords from the map to a list of the paths to that
    keyword had get-in been used."
-  [query]
+  [query rep-coll]
   ; perform tree traversal where each tree node is a tuple of
   ; the path from the root to the current node and the sub-tree
-  (letfn [(val-is-map? [[_ v]] (map? v))
-          (val-is-vec? [[_ v]] (vector? v))
-          (val-is-coll? [[_ v]] (coll? v))
+  (letfn [(val-is-coll? [[_ v]] (coll? v))
           (val-qualified? [[_ v]] (and (qualified? v)
                                        (not= v ::_)))
-          (unwrap-map [[p m]] (for [[k v] m]
-                                (if (= k ::as)
-                                  [p v]
-                                  [(conj p k) v])))
-          (unwrap-vec [[p v]] (for [n v]
-                                [(conj p ::list) n]))
-          (unwrap [tuple] (cond (val-is-map? tuple)
-                            (unwrap-map tuple)
-                            (val-is-vec? tuple)
-                            (unwrap-vec tuple)))]
+          (unwrap-map [[p m]] (mapcat (fn [[k v]]
+                                        (if (= k ::as)
+                                          [[p v]]
+                                          [[(conj p k) v]
+                                           [(conj p ::key) k]]))
+                                      m))
+          (unwrap-seq [[p s]] (if rep-coll
+                                (map (fn [v]
+                                       [(conj p ::list) v])
+                                     s)
+                                (map-indexed (fn [idx v]
+                                               [(conj p idx) v])
+                                             s)))
+          (unwrap-simple [[_ v :as tuple]]
+            (cond (map? v)
+                  (unwrap-map tuple)
+                  (sequential? v)
+                  (unwrap-seq tuple)))
+          (unwrap [[path value :as tuple]]
+            (let [coll-params (extract-coll-params value)]
+              (if (nil? coll-params)
+                (unwrap-simple tuple)
+                (list [(conj path coll-params) ::for]))))]
     (filter val-qualified?
       (tree-seq val-is-coll? unwrap [[] query]))))
 
@@ -151,31 +186,23 @@
   (reduce (fn [m [p v]]
             (assert (not (contains? m v)))
             (assoc m v p))
-          {} (extract-bindings query)))
+          {} (extract-bindings query true)))
 
-(defn- empty-coll [coll]
-  (if (map-entry? coll) [] (empty coll)))
+(defn parse-format
+  [query]
+  (update
+    (reduce (fn [m [p v]] (assoc m v (conj (get m v []) p)))
+            {} (extract-bindings query false))
+    ::for
+    (partial mapv #(update % (- (count %) 1)
+                           (fn [[params subquery]]
+                             [params subquery
+                              (parse-format subquery)])))))
 
 
 ; conversion between formats
-(defn- extract-coll-params
-  "Detect whether a collection has the form
-   [[?for ?v1 ?v2...] shape] and return [(?v1 ?v2 ...) shape].
-   Return nil if pattern not match."
-  [coll]
-  (cond
-    (and (sequential? coll)
-         (vector? (first coll))
-         (= ::for (first (first coll))))
-    [(rest (first coll)) (rest coll)]
-
-    (set? coll)
-    (let [is-param (group-by #(and (vector? %)
-                                   (= ::for (first %)))
-                             coll)]
-      [(rest (first (is-param true))) (is-param false)])
-
-    :else nil))
+(defn- empty-coll [coll]
+  (if (map-entry? coll) [] (empty coll)))
 
 (defn- split-list
   "Split a sequence using the keyword ::list. To distinguish
@@ -252,109 +279,111 @@
        ; :depth is used in extract-list-bindings
        (into {:data data :depth 0})))
 
+(defn- assoc-on
+  "assoc-in handling the edge case where path is []"
+  [m p v]
+  (if (empty? p) v (assoc-in m p v)))
+
+(defn- update-on
+  "assoc-in handling the edge case where path is []"
+  [m p f]
+  (if (empty? p) (f m) (update-in m p f)))
+
+(defn reshape
+  "An optimized version of convert when ?for is not used."
+  [shape params bindings]
+  (reduce (fn [shape [param paths]]
+            (loop [new-shape shape
+                   [path rest-paths] paths]
+              (assert (contains? bindings param)
+                      (str "Parameters "
+                           (dequalify-kw param)
+                           "unbinded"))
+              (cond
+                (nil? path) new-shape
+                (= ::key (peek path))
+                (update-on new-shape (pop path)
+                           (fn [sub-shape]
+                             (assoc (dissoc sub-shape param)
+                                    (bindings param)
+                                    (sub-shape param))))
+                :else (recur (assoc-in new-shape path
+                                       (bindings param))
+                             rest-paths))))
+          shape params))
+
+(defn apply-binding
+  [in-params out-params out-format binding_]
+  (loop [result (reshape out-format (dissoc out-params ::for)
+                          binding_)
+         for-list (::for out-params)]
+    (if (empty? for-list)
+      result
+      (let [cur-list (peek for-list)
+            cur-path (pop cur-list)
+            [coll-params sub-format sub-params] (peek cur-list)]
+        (assoc-on result cur-path
+                  (into (empty sub-format)
+                        (mapcat #(apply-binding in-params
+                                                sub-params
+                                                sub-format %))
+                        (extract-list-bindings in-params
+                                               coll-params
+                                               binding_)))))))
+
 (defn convert
   "Given the parsed mapping for two formats, convert the data
   from one format to another.
   params-loc - expected to be produced by extract-params
   out-format - format of desired output
   data       - expected to conform to the shape of in"
-  [params-loc out-format data]
-  ; Perform in-place binding on all qualified parameters in
-  ; out-format by performing a recursive tree traversal through
-  ; the data structure. Start with a sequence of the unconverted
-  ; values in waiting, take one out, recursively convert it,
-  ; then put it at the end of processed. When encountering a
-  ; collection, push its contents as a new layer onto the stack
-  ; of waiting values, and remember the type of the collection
-  ; in colls. When all values in a layer is processed, put the
-  ; values back into the same type of collection. Use bindings
-  ; to keep track of the cases where a parameter can bind to
-  ; multiple values.
-  (loop [processed (list (list))
-         waiting (list (list out-format))
-         colls   (list (list))
-         bindings (list (list (form-binding params-loc data)))]
-    (let [[cur-wait           & rest-wait] waiting
-          [cur-elem           & rest-elem] cur-wait
-          [cur-proc next-proc & rest-proc] processed]
-      (cond
-        ; when all possible bindings are exausted, pop the layer
-        ; of bindings, append results at the end of previous
-        ; layer's processed
-        (empty? (first bindings))
-        (recur (->> cur-proc
-                    (into (second colls))
-                    (conj next-proc)
-                    (conj rest-proc))
-               (conj (pop (pop rest-wait))
-                     (rest (peek (pop rest-wait))))
-               (pop (pop colls))
-               (pop bindings))
-
-        (empty? cur-wait)
-        (cond
-          ; all elements processed, exit func
-          (nil? rest-wait) (first cur-proc)
-
-          ; pop layer from bindings
-          (= :bindings (peek colls))
-          (recur processed
-                 (conj rest-wait (peek rest-wait))
-                 colls
-                 (conj (pop bindings) (rest (peek bindings))))
-
-          :else
-          ; pop layer from stacks
-          (recur (->> cur-proc
-                      (into (peek colls))
-                      (conj next-proc)
-                      (conj rest-proc))
-                 rest-wait
-                 (pop colls)
-                 bindings))
-
-        (coll? cur-elem)
-        (let [[coll-params element]
-              (extract-coll-params cur-elem)]
-        (if (nil? coll-params)
-          (recur (conj processed [])
-                 (conj (conj rest-wait rest-elem)
-                       (seq cur-elem))
-                 (conj colls (empty-coll cur-elem))
-                 bindings)
-          (recur (conj processed [])
-                 ; keep cur-elem unprocessed so it
-                 ; can be reused for multiple bindings
-                 (conj (conj waiting element) element)
-                 (conj (conj colls (empty cur-elem)) :bindings)
-                 (conj bindings (extract-list-bindings
-                                  params-loc
-                                  coll-params
-                                  (first (first bindings)))))))
-
-        ; move one element from waiting to processed
-        ; bind value if element is qualified param
-        :else (recur (->> (if (qualified? cur-elem)
-                            (let [binded
-                                  (get (first (first bindings))
-                                       cur-elem
-                                       ::unbinded)]
-                              (assert (not= binded ::unbinded)
-                                      (str "Parameter "
-                                           (dequalify-kw cur-elem)
-                                           "unresolved"))
-                              binded)
-                            cur-elem)
-                          (conj cur-proc)
-                          (conj (pop processed)))
-                     (conj rest-wait rest-elem)
-                     colls
-                     bindings)))))
+  ([in-format out-format data]
+   (convert (extract-params in-format)
+                  (parse-format out-format) out-format
+                  data))
+  ([in-params out-params out-format data]
+   (apply-binding in-params out-params out-format
+                  (form-binding in-params data))))
 
 (defmacro precompile
   "Evaluate query building and parameters extraction at compile time.
-   Return [(build (qualify query))
-           (extract-params (qualify query))]."
+  Return [(build (qualify query))
+  (extract-params (qualify query))]."
   [query]
   (let [q (qualify query)]
     [(build q) (extract-params q)]))
+
+(def d2
+  (into {} (for [i (range 100)]
+             [i (into {} (for [j (range 100)]
+                           [j (str i "." j)]))])))
+
+(def inf (into {} (for [i (range 50 70)]
+                    [i (into {} (for [j (range 50 70)]
+                                  [j (keyword (str prefix "/" i "." j))]))])))
+
+(def outf (into {} (for [i (range 50 70)
+                         j (range 50 70)]
+                     [(str i "." j)
+                      (keyword (str prefix "/" i "." j))])))
+(def ip (extract-params inf))
+(def op (parse-format outf))
+(def b (form-binding ip d2))
+
+(def data
+  {"form"
+   (into [] (for [field (range 10)]
+              {"field" field
+               "subfields"
+               (into [] (for [subfield (range 10)]
+                          {"name" (str subfield)
+                           "value" subfield}))}))})
+(def params (-> {"form" [{"field" ?field
+                          "subfields" [{"name" ?name
+                                        "value" ?value}]}]}
+                qualify extract-params))
+(def output-format (qualify [[?for ?field ?name ?value]
+                             {:field ?field
+                              :name ?name
+                              :value ?value}]))
+(def out-params (parse-format output-format))

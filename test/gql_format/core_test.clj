@@ -114,28 +114,27 @@
 (deftest unique-symbol
   (testing (str "extract-params should throw assertion error when"
                 " same symbol is used multiple times.")
-    (is (try (nil? (gf/extract-params (gf/qualify
-                                        {"field1" ?val1
-                                         "field2" ?val1})))
-             (catch AssertionError _ true)))))
+    (is (thrown? AssertionError
+                 (gf/extract-params (gf/qualify
+                                      {"field1" ?val1
+                                       "field2" ?val1}))))))
 
 (deftest convert-flat-map
   (testing "convert flat data from flat format to flat format"
     (is (= (gf/convert (-> {"field1" ?val1
                             "field2" ?val2}
-                           gf/qualify
-                           gf/extract-params)
-                       (gf/qualify {?val1 ?val2})
+                           gf/qualify)
+                       (gf/qualify {:field1 ?val1
+                                    :field2 ?val2})
                        {"field1" 1
                         "field2" 2})
-           {1 2}))))
+           {:field1 1 :field2 2}))))
 
 (deftest convert-nested-data
   (testing "convert nested data to a flat format"
     (is (= (gf/convert (-> {"field1" ?val1
                             "field2" {"field3" ?val2}}
-                           gf/qualify
-                           gf/extract-params)
+                           gf/qualify)
                        (gf/qualify {?val1 ?val2})
                        {"field1" 1
                         "field2" {"field3" 2}})
@@ -145,8 +144,7 @@
   (testing "convert nested data to a nested format"
     (is (= (gf/convert (-> {"field1" ?val1
                             "field2" {"field3" ?val2}}
-                           gf/qualify
-                           gf/extract-params)
+                           gf/qualify)
                        (gf/qualify {:a ?val1
                                     :b {:c ?val2}})
                        {"field1" 1
@@ -155,17 +153,16 @@
 
 (deftest convert-detect-unbinded-param
   (testing "convert format should contain no unbinded parameter"
-    (is (try (nil? (-> {"field1" ?v1}
-                       gf/qualify gf/extract-params
-                       (gf/convert
-                         (gf/qualify ?v2)
-                         {"field1" 1})))
-             (catch AssertionError _ true)))))
+    (is (thrown? AssertionError
+                 (gf/convert
+                   (gf/qualify {"field1" ?v1})
+                   (gf/qualify ?v2)
+                   {"field1" 1})))))
 
 (deftest convert-list-binding
   (testing "convert to a vector container"
     (is (= (-> {"field1" ?v1 "field2" [?v2]}
-               gf/qualify gf/extract-params
+               gf/qualify
                (gf/convert (gf/qualify [[?for ?v2] ?v2])
                            {"field1" 1
                             "field2" [2 3 4]}))
@@ -175,7 +172,7 @@
   (testing "convert parameter binded to multiple values"
     (is (= (-> {"field1" ?v1
                 "field2" [?v2]}
-               gf/qualify gf/extract-params
+               gf/qualify
                (gf/convert (gf/qualify [[?for ?v2] ?v2])
                            {"field1" 1
                             "field2" [2 3 4]}))
@@ -185,7 +182,7 @@
   (testing "convert with multiple parameters binded to multiple values"
     (is (= (-> {"field1" ?v1
                 "field2" [?v2]}
-               gf/qualify gf/extract-params
+               gf/qualify
                (gf/convert (gf/qualify [[?for ?v2] ?v1 ?v2])
                            {"field1" 1
                             "field2" [2 3 4]}))
@@ -195,43 +192,51 @@
   (testing (str "Assert error when parameters in the same "
                 "collection bind to values originally from "
                 "different lists")
-    (is (try (nil? (-> {"field1" [?v1]
+    (is (thrown? AssertionError
+                 (-> {"field1" [?v1]
                         "field2" [?v2]}
-                       gf/qualify gf/extract-params
+                       gf/qualify
                        (gf/convert
                          (gf/qualify [[?for ?v1 ?v2] ?v1 ?v2])
                          {"field1" [1 2 3]
-                          "field2" [2 3 4]})))
-             (catch AssertionError _ true)))))
+                          "field2" [2 3 4]}))))))
 
+(deftest convert-map-iterative-binding
+  (testing "convert with parameters binded to multiple values in map"
+    (is (= (gf/convert (gf/qualify {"entries" [{"name" ?name
+                                                "value" ?value}]})
+                       (gf/qualify {?for [?name ?value]
+                                    ?name ?value})
+                       {"entries" [{"name" "a", "value" 1}
+                                   {"name" "b", "value" 2}]})
+           {"a" 1, "b" 2}))))
+
+(comment
 (deftest convert-set-iterative-binding
   (testing "bind multiple values to a set"
     (is (= (-> {"field1" ?v1
                 "field2" [?v2]}
-               gf/qualify gf/extract-params
+               gf/qualify
                (gf/convert (gf/qualify #{[?for ?v2] ?v2})
                            {"field1" 1
                             "field2" [2 3 4]}))
            #{2 3 4}))))
+)
 
 (deftest convert-nested-list-iterative-binding
   (testing "convert parameter binded to multiple values"
     (is (= (-> {"field1" ?v1
                 "field2" [{"list" ?v2
                            "sublist" [?v3]}]}
-               gf/qualify gf/extract-params
+               gf/qualify
                (gf/convert (gf/qualify [[?for ?v2]
-                                        {?v2 [[?for ?v3] ?v3]}])
+                                        [?v2 [[?for ?v3] ?v3]]])
                            {"field1" 1
                             "field2" [{"list" "cat1"
                                        "sublist" ["subcat1"
                                                   "subcat2"]}
                                       {"list" "cat2"
                                        "sublist" ["subcat1"
-                                                  "subcat2"]}
-                                      {"list" "cat3"
-                                       "sublist" ["subcat1"
                                                   "subcat2"]}]}))
-           [{"cat1" ["subcat1" "subcat2"]}
-            {"cat2" ["subcat1" "subcat2"]}
-            {"cat3" ["subcat1" "subcat2"]}]))))
+           [["cat1" ["subcat1" "subcat2"]]
+            ["cat2" ["subcat1" "subcat2"]]]))))
