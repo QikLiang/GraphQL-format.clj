@@ -1,5 +1,5 @@
 (ns gql-format.core
-  (:require [clojure.walk :refer [postwalk postwalk-replace]]
+  (:require [clojure.walk :refer [walk postwalk prewalk]]
             [clojure.string :as str]))
 
 ; prefix namespace used to ensure keywords are unique
@@ -296,9 +296,8 @@
             (loop [new-shape shape
                    [path rest-paths] paths]
               (assert (contains? bindings param)
-                      (str "Parameters "
-                           (dequalify-kw param)
-                           "unbinded"))
+                  (str "Symbol " (dequalify-kw param)
+                       " not found in input format"))
               (cond
                 (nil? path) new-shape
                 (= ::key (peek path))
@@ -387,3 +386,151 @@
                               :name ?name
                               :value ?value}]))
 (def out-params (parse-format output-format))
+
+(def simp-param (qualify
+                  {"entries" [{"name" ?name "value" ?value}]}))
+(def simp-data {"entries" [{"name" "a", "value" 1}
+                           {"name" "b", "value" 2}]})
+(def simp-output (qualify {?for [?name ?value]
+                           ?name ?value}))
+
+(defn prewalk-inherit
+  "Like prewalk, but allow an extra state to be passed from parent
+   to children. Expect f to take parameters [form & state] and
+   return [[children] & new-state] where new-state must be
+   acceptable by a new call to f."
+  [f form state]
+  (let [[children & new-state] (f form state)]
+    (walk #(apply prewalk-inherit f % new-state)
+          identity children)))
+
+(defn iter-var [iter]
+  (if (zero? iter)
+    '?data
+    (symbol (str "iter-var-" iter))))
+
+(defn iter-depth [path]
+  (count (filter #{(qualify ?list)} path)))
+
+(defn create-get-in-exp [path]
+  (let [iter-paths (split-list path)
+        iter (dec (count iter-paths))
+        get-path (last iter-paths)
+        var-symbol (iter-var iter)]
+    (if (empty? get-path)
+      var-symbol
+      `(get-in ~var-symbol
+               [~@(last (split-list path))]))))
+
+(declare create-inner-form)
+
+(defn create-let-expression
+  [form get-symbol param-paths min-iter-depth max-iter-depth]
+  `(let
+     [~@(apply concat
+               (for [[sym path] param-paths
+                     :let [iter-len (iter-depth path)]
+                     :when (and (<= min-iter-depth iter-len)
+                                (<= iter-len max-iter-depth))]
+                 [(get-symbol sym) (create-get-in-exp path)]))]
+     ~(create-inner-form
+        form get-symbol param-paths max-iter-depth)))
+
+(defn create-iter-params
+  [iter-params param-paths cur-iter-depth]
+  (let [iter-paths (mapv (comp split-list param-paths)
+                         iter-params)
+        iter-path (apply max-key count iter-paths)
+        new-iter-depth (dec (count iter-path))]
+    [(vec (mapcat
+            (fn [iter]
+              [(iter-var (inc iter))
+               `(get-in ~(iter-var iter)
+                        [~@(nth iter-path iter)])])
+            (range cur-iter-depth
+                   new-iter-depth)))
+     new-iter-depth]))
+
+(defn create-for-expression
+  [iter-params sub-form get-symbol param-paths cur-iter-depth]
+  (let [[iter-list new-iter-depth]
+        (create-iter-params iter-params param-paths cur-iter-depth)]
+    `(for ~iter-list
+       ~(create-let-expression
+          sub-form get-symbol param-paths
+          (inc cur-iter-depth) new-iter-depth))))
+
+(defn create-inner-form
+  [form get-symbol param-paths cur-iter-depth]
+  (assert (or (not (qualified? form))
+              (contains? get-symbol form))
+          (str "Symbol " (dequalify-kw form)
+               " not found in input format"))
+  (cond
+    (qualified? form) (get-symbol form)
+
+    ; [?for ?param] expressions
+    (and (vector? form)
+         (= (qualify ?for) (first form))
+         (= (count form) 2))
+    (let [list-params [(second form)]
+          sub-form (second form)
+          for-exp (create-for-expression list-params sub-form
+                                         get-symbol param-paths
+                                         cur-iter-depth)]
+      `(vec ~for-exp))
+
+    ; [?for [?params] sub-form] expressions
+    (and (vector? form)
+         (= (qualify ?for) (first form))
+         (= (count form) 3))
+    (let [list-params (second form)
+          sub-form (last form)
+          for-exp (create-for-expression list-params sub-form
+                                         get-symbol param-paths
+                                         cur-iter-depth)]
+      `(vec ~for-exp))
+
+    ; [?for [?params] sub-form1 sub-form2 ...] expressions
+    (and (vector? form)
+         (= (qualify ?for) (first form))
+         (> (count form) 3))
+    (let [list-params (second form)
+          sub-form (vec (drop 2 form))
+          for-exp (create-for-expression list-params sub-form
+                                         get-symbol param-paths
+                                         cur-iter-depth)]
+      `(vec (apply concat ~for-exp)))
+
+    ; {?for [?params] ?key ?val} expressions
+    (and (map? form)
+         (contains? form (qualify ?for)))
+    (let [list-params (form (qualify ?for))
+          sub-form (vec (dissoc form (qualify ?for)))
+          for-exp (create-for-expression list-params sub-form
+                                         get-symbol param-paths
+                                         cur-iter-depth)]
+      `(into {} (apply concat ~for-exp)))
+
+    ; recursively traverse ordinary data structures
+    :else (walk #(create-inner-form
+                   % get-symbol param-paths cur-iter-depth)
+                identity form)))
+
+(defn create-fn-expression [in-shape out-shape]
+  (let [param-paths (extract-params in-shape)
+        get-symbol (reduce-kv (fn [m k _]
+                                (->> k
+                                     ; strip namespace
+                                     dequalify-kw
+                                     ; generate unique symbol
+                                     gensym
+                                     (assoc m k)))
+                              {}
+                              param-paths)]
+    (list 'fn '[?data]
+       (create-let-expression out-shape get-symbol param-paths 0 0))))
+
+(defmacro converter [in-shape out-shape]
+  (create-fn-expression (eval in-shape) (eval out-shape)))
+
