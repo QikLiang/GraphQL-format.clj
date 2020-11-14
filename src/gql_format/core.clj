@@ -107,7 +107,7 @@
     (vector? obj) (build-query-vec obj)
     :else obj))
 
-(defn build
+(defn query
   "build a GraphQL query string using the expected output shape"
   [output]
   (if (and (map? output) (contains? output "query"))
@@ -117,30 +117,6 @@
 
 
 ; transform output to desired format
-(defn- extract-coll-params
-  "Detect whether a collection has the form
-   [[?for ?v1 ?v2...] shape] and return [(?v1 ?v2 ...) shape].
-   Return nil if pattern not match."
-  [coll]
-  (cond
-    (and (sequential? coll)
-         (vector? (first coll))
-         (= ::for (first (first coll))))
-    [(rest (first coll)) (into (empty coll) (rest coll))]
-
-    (and (map? coll)
-         (contains? coll ::for))
-    [(::for coll) (dissoc coll ::for)]
-
-    (set? coll)
-    (let [is-param (group-by #(and (vector? %)
-                                   (= ::for (first %)))
-                             coll)]
-      [(rest (first (is-param true)))
-       (apply disj (is-param false))])
-
-    :else nil))
-
 (defn extract-bindings
   "From a nested map, extract a list of tuples from all qualified
    keywords from the map to a list of the paths to that
@@ -164,16 +140,11 @@
                                 (map-indexed (fn [idx v]
                                                [(conj p idx) v])
                                              s)))
-          (unwrap-simple [[_ v :as tuple]]
+          (unwrap [[_ v :as tuple]]
             (cond (map? v)
                   (unwrap-map tuple)
                   (sequential? v)
-                  (unwrap-seq tuple)))
-          (unwrap [[path value :as tuple]]
-            (let [coll-params (extract-coll-params value)]
-              (if (nil? coll-params)
-                (unwrap-simple tuple)
-                (list [(conj path coll-params) ::for]))))]
+                  (unwrap-seq tuple)))]
     (filter val-qualified?
       (tree-seq val-is-coll? unwrap [[] query]))))
 
@@ -187,22 +158,6 @@
             (assert (not (contains? m v)))
             (assoc m v p))
           {} (extract-bindings query true)))
-
-(defn parse-format
-  [query]
-  (update
-    (reduce (fn [m [p v]] (assoc m v (conj (get m v []) p)))
-            {} (extract-bindings query false))
-    ::for
-    (partial mapv #(update % (- (count %) 1)
-                           (fn [[params subquery]]
-                             [params subquery
-                              (parse-format subquery)])))))
-
-
-; conversion between formats
-(defn- empty-coll [coll]
-  (if (map-entry? coll) [] (empty coll)))
 
 (defn- split-list
   "Split a sequence using the keyword ::list. To distinguish
@@ -219,198 +174,13 @@
         (empty? rest-path) (conj (conj chunks path-chunk) (list))
         :else (recur (conj chunks path-chunk) rest-path)))))
 
-(defn- extract-list-bindings
-  "Given a list of parameters that can bind to multiple values
-   and the existing binding, generate a sequence of new bindings
-   such that the parameters are binded to each possible
-   combination of values."
-  [params-loc params bindings]
-  (loop [[[len to-list post-list :as paths]
-          & rest-paths :as all-paths]
-         (->> (select-keys params-loc params)
-              (map #(update % 1 split-list))
-              (group-by #(count (second %)))
-              (map (fn [[len paths]]
-                     (assert (apply = (map #(pop (second %))
-                                           paths))
-                             (str "Parameters "
-                                  (map dequalify-kw params)
-                                  " must extract values from the"
-                                  " same collection"))
-                     [len
-                      ; part before the last ::list,
-                      ; first instead of map because
-                      ; they should all be the same
-                      (pop (second (first paths)))
-                      ; a mapping from parameters to
-                      ; the part after the last ::list
-                      (map #(update % 1 peek) paths)]))
-              (sort-by first))
-         depth (:depth bindings)
-         results [bindings]]
-    (cond
-      (empty? paths) results
-
-      (< (inc depth) len)
-      (recur all-paths (inc depth)
-             (mapcat (fn [result]
-                       (for [new-data (get-in
-                                        (:data result)
-                                        (to-list depth)
-                                        ::unbinded)]
-                         (-> result
-                             (assoc :data new-data)
-                             (update :depth inc))))
-                     results))
-
-      :else
-      (recur rest-paths depth
-             (for [result results]
-               (into result
-                     (for [[param path] post-list]
-                       [param
-                        (get-in (:data result) path ::unbinded)])))))))
-
-(defn- form-binding
-  "construct the initial binding used by convert"
-  [params-loc data]
-  (->> (for [[param path] params-loc]
-         [param (get-in data path ::unbinded)])
-       ; :depth is used in extract-list-bindings
-       (into {:data data :depth 0})))
-
-(defn- assoc-on
-  "assoc-in handling the edge case where path is []"
-  [m p v]
-  (if (empty? p) v (assoc-in m p v)))
-
-(defn- update-on
-  "assoc-in handling the edge case where path is []"
-  [m p f]
-  (if (empty? p) (f m) (update-in m p f)))
-
-(defn reshape
-  "An optimized version of convert when ?for is not used."
-  [shape params bindings]
-  (reduce (fn [shape [param paths]]
-            (loop [new-shape shape
-                   [path rest-paths] paths]
-              (assert (contains? bindings param)
-                  (str "Symbol " (dequalify-kw param)
-                       " not found in input format"))
-              (cond
-                (nil? path) new-shape
-                (= ::key (peek path))
-                (update-on new-shape (pop path)
-                           (fn [sub-shape]
-                             (assoc (dissoc sub-shape param)
-                                    (bindings param)
-                                    (sub-shape param))))
-                :else (recur (assoc-in new-shape path
-                                       (bindings param))
-                             rest-paths))))
-          shape params))
-
-(defn apply-binding
-  [in-params out-params out-format binding_]
-  (loop [result (reshape out-format (dissoc out-params ::for)
-                          binding_)
-         for-list (::for out-params)]
-    (if (empty? for-list)
-      result
-      (let [cur-list (peek for-list)
-            cur-path (pop cur-list)
-            [coll-params sub-format sub-params] (peek cur-list)]
-        (assoc-on result cur-path
-                  (into (empty sub-format)
-                        (mapcat #(apply-binding in-params
-                                                sub-params
-                                                sub-format %))
-                        (extract-list-bindings in-params
-                                               coll-params
-                                               binding_)))))))
-
-(defn convert
-  "Given the parsed mapping for two formats, convert the data
-  from one format to another.
-  params-loc - expected to be produced by extract-params
-  out-format - format of desired output
-  data       - expected to conform to the shape of in"
-  ([in-format out-format data]
-   (convert (extract-params in-format)
-                  (parse-format out-format) out-format
-                  data))
-  ([in-params out-params out-format data]
-   (apply-binding in-params out-params out-format
-                  (form-binding in-params data))))
-
-(defmacro precompile
-  "Evaluate query building and parameters extraction at compile time.
-  Return [(build (qualify query))
-  (extract-params (qualify query))]."
-  [query]
-  (let [q (qualify query)]
-    [(build q) (extract-params q)]))
-
-(def d2
-  (into {} (for [i (range 100)]
-             [i (into {} (for [j (range 100)]
-                           [j (str i "." j)]))])))
-
-(def inf (into {} (for [i (range 50 70)]
-                    [i (into {} (for [j (range 50 70)]
-                                  [j (keyword (str prefix "/" i "." j))]))])))
-
-(def outf (into {} (for [i (range 50 70)
-                         j (range 50 70)]
-                     [(str i "." j)
-                      (keyword (str prefix "/" i "." j))])))
-(def ip (extract-params inf))
-(def op (parse-format outf))
-(def b (form-binding ip d2))
-
-(def data
-  {"form"
-   (into [] (for [field (range 10)]
-              {"field" field
-               "subfields"
-               (into [] (for [subfield (range 10)]
-                          {"name" (str subfield)
-                           "value" subfield}))}))})
-(def params (-> {"form" [{"field" ?field
-                          "subfields" [{"name" ?name
-                                        "value" ?value}]}]}
-                qualify extract-params))
-(def output-format (qualify [[?for ?field ?name ?value]
-                             {:field ?field
-                              :name ?name
-                              :value ?value}]))
-(def out-params (parse-format output-format))
-
-(def simp-param (qualify
-                  {"entries" [{"name" ?name "value" ?value}]}))
-(def simp-data {"entries" [{"name" "a", "value" 1}
-                           {"name" "b", "value" 2}]})
-(def simp-output (qualify {?for [?name ?value]
-                           ?name ?value}))
-
-(defn prewalk-inherit
-  "Like prewalk, but allow an extra state to be passed from parent
-   to children. Expect f to take parameters [form & state] and
-   return [[children] & new-state] where new-state must be
-   acceptable by a new call to f."
-  [f form state]
-  (let [[children & new-state] (f form state)]
-    (walk #(apply prewalk-inherit f % new-state)
-          identity children)))
-
 (defn iter-var [iter]
   (if (zero? iter)
     '?data
     (symbol (str "iter-var-" iter))))
 
 (defn iter-depth [path]
-  (count (filter #{(qualify ?list)} path)))
+  (count (filter #{::list} path)))
 
 (defn create-get-in-exp [path]
   (let [iter-paths (split-list path)
@@ -502,6 +272,28 @@
                                          cur-iter-depth)]
       `(vec (apply concat ~for-exp)))
 
+    ; #{?for ?param} expressions
+    (and (set? form)
+         (contains? form (qualify ?for))
+         (= (count form) 2))
+    (let [list-params (disj form (qualify ?for))
+          sub-form (first list-params)
+          for-exp (create-for-expression list-params sub-form
+                                         get-symbol param-paths
+                                         cur-iter-depth)]
+      `(set ~for-exp))
+
+    ; #{?for ?param1 ?param2 ...} expressions
+    (and (set? form)
+         (contains? form (qualify ?for))
+         (> (count form) 2))
+    (let [list-params (disj form (qualify ?for))
+          sub-form (vec list-params)
+          for-exp (create-for-expression list-params sub-form
+                                         get-symbol param-paths
+                                         cur-iter-depth)]
+      `(set (apply concat ~for-exp)))
+
     ; {?for [?params] ?key ?val} expressions
     (and (map? form)
          (contains? form (qualify ?for)))
@@ -531,6 +323,5 @@
     (list 'fn '[?data]
        (create-let-expression out-shape get-symbol param-paths 0 0))))
 
-(defmacro converter [in-shape out-shape]
+(defmacro precompile [in-shape out-shape]
   (create-fn-expression (eval in-shape) (eval out-shape)))
-
