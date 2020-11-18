@@ -213,3 +213,12 @@
     (testing "convert parameter binded to multiple values"
       (is (= (converter data) expected)))))
 
+(deftest converter-with-user-code
+  (let [in-format (gf/qualify {"values" [?vals]})
+        out-format (gf/qualify `(reduce + ?vals))
+        data {"values" [1 2 3 4]}
+        converter (eval (gf/create-fn-expression
+                          in-format out-format))
+        expected 10]
+    (testing "convert parameter binded to multiple values"
+      (is (= (converter data) expected)))))

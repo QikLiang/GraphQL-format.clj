@@ -1,7 +1,6 @@
 (ns gql-format.core
   (:require [clojure.walk :refer [walk postwalk]]
-            [clojure.string :as str]
-            [clojure.pprint :refer [pprint]]))
+            [clojure.string :as str]))
 
 ; prefix namespace used to ensure keywords are unique
 (def prefix (str (ns-name *ns*)))
@@ -110,11 +109,13 @@
 
 (defn query
   "build a GraphQL query string using the expected output shape"
-  [output]
-  (if (and (map? output) (contains? output "query"))
-    (str "query" (str/join "" (postwalk build-subquery
-                                        (output "query"))))
-    (second (postwalk build-subquery output))))
+  ([params form]
+   (query {"query" (into form params)}))
+  ([output]
+   (if (and (map? output) (contains? output "query"))
+     (str "query" (str/join "" (postwalk build-subquery
+                                         (output "query"))))
+     (second (postwalk build-subquery output)))))
 
 
 ; transform output to desired format
@@ -232,7 +233,8 @@
   (take-while some? (iterate (comp :parent graph) param)))
 
 (defn- create-get-in-binding [graph param]
-  (let [{self :symbol path :path source :parent} (graph param)]
+  (let [{self :symbol path :path parent :parent} (graph param)
+        source (-> parent graph :symbol)]
     (cond
       (empty? path) [self source]
       (= 1 (count path)) [self `(get ~source ~(first path))]
@@ -382,12 +384,10 @@
         [let-exp _]
         (create-let-expression out-shape param-paths
                                #{(root :param)})]
-    (pprint param-paths)
     (list 'fn [(root :symbol)] let-exp)))
 
 (defmacro precompile [in-shape out-shape]
   (create-fn-expression (eval in-shape) (eval out-shape)))
 
 (defn converter [in-shape out-shape]
-  (pprint (create-fn-expression in-shape out-shape))
   (eval (create-fn-expression in-shape out-shape)))
