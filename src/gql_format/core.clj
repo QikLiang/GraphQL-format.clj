@@ -1,5 +1,5 @@
 (ns gql-format.core
-  (:require [clojure.walk :refer [walk postwalk prewalk]]
+  (:require [clojure.walk :refer [walk postwalk]]
             [clojure.string :as str]
             [clojure.pprint :refer [pprint]]))
 
@@ -127,14 +127,24 @@
     :else #{}))
 
 (defn extract-dependencies
+  "Returns a tuple of two lists of maps with these parameters:
+   :param - the key for keeping track of nodes internally
+   :symbol - representation in the generated code
+   :parent - most recent ancester node in the syntax tree
+   :path - current node = (get-in parent path)
+   :list - true if current node holds a vector
+   :depth - distance from root form
+   Paths are constructed as lists so parent nodes can be in-lined
+   by conj'ing to the child's path"
   [form parent edge params-used depth]
   (cond
     (= ::as edge) [[] []]
 
     (map? form)
-    (let [self-sym (if (contains? form ::as)
-                     (gensym (dequalify-kw (form ::as)))
-                     (gensym "?var"))
+    (let [self-sym (cond (contains? form ::as)
+                     (gensym (str (dequalify-kw (form ::as)) \-))
+                     (= edge ::list) (gensym "??iter-var-")
+                     :else (gensym (str "??" edge \-)))
           self-param (if (contains? form ::as)
                        (form ::as)
                        (qualify-kw self-sym))
@@ -149,7 +159,7 @@
         (empty? children) [[] []] ; no dependents
         ; in-line current node if only used by one child
         (and (= 1 (count children))
-             (some? edge) ; don't in-line root
+             (some? parent) ; don't in-line root
              (not= edge ::list))
         [(for [child children
                :let [path (conj (:path child) edge)]]
@@ -162,6 +172,16 @@
                  :parent parent
                  :depth depth}]
                (concat children other-dependents)]))
+
+    (and (vector? form) (= (first form) ::as))
+    (let [actual-form (vec (drop 2 form))
+          param (second form)
+          [[self] children]
+          (extract-dependencies actual-form parent edge
+                                params-used depth)]
+      [[(assoc self :symbol (gensym (dequalify-kw param)))]
+       children])
+
     ; current form is an array of values
     (vector? form)
     (let [[[{:keys [param symbol]}] other-dependents]
@@ -189,35 +209,42 @@
     ; return nothing if form not interesting
     :else [[] []]))
 
-(defn extract-params
-  "Intending to be used when binding parameters to query output.
-   Extract bindings from a query and asserting that each qualified
-   symbol is unique. When there are duplicates of the same symbol,
-   it throws."
+(defn- extract-params
+  "Generate dependency graph of how to access parameters within
+   input format by combining output of extract-dependencies.
+   Return a tuple of the result graph represented as a map from
+   the id (i.e. :param) to the node and the root node."
   [form params-used]
   (let [[[root] params]
-        (extract-dependencies (assoc form ::as ::data)
-                              nil nil params-used 0)
+        (extract-dependencies form nil "input" params-used 0)
         result (reduce (fn [m p] (assoc m (:param p) p)) {}
-                       (conj params (assoc root :depth -1)))]
+                       (conj params root))]
     (doseq [param params-used]
       (assert (contains? result param)
               (str "Parameter " (dequalify-kw param)
                    " not found in input format")))
-    result))
+    [result root]))
 
-(defn traverse-dependencies [graph param]
+(defn- traverse-dependencies
+  "Generate the list of all nodes from the specified node up
+   to the root."
+  [graph param]
   (take-while some? (iterate (comp :parent graph) param)))
 
-(defn create-get-in-exp [source path]
-  (cond
-    (empty? path) source
-    (= 1 (count path)) `(get ~source ~(first path))
-    :else `(get-in ~source [~@path])))
+(defn- create-get-in-binding [graph param]
+  (let [{self :symbol path :path source :parent} (graph param)]
+    (cond
+      (empty? path) [self source]
+      (= 1 (count path)) [self `(get ~source ~(first path))]
+      :else [self `(get-in ~source [~@path])])))
+
+; all create-* functions below return a tuple of the generated
+; function body and a set of parameters that it use but has not
+; bound
 
 (declare create-inner-form)
 
-(defn create-let-expression
+(defn- create-let-expression
   [form param-paths dont-bind]
   (let [[inner-form unbound-params]
         (create-inner-form form param-paths dont-bind)
@@ -227,19 +254,13 @@
              (sort-by (comp :depth param-paths)))
 
         still-unbound (apply disj (set unbound-params) bind-here)
-        new-params
-        (apply concat
-               (for [param bind-here
-                     :let [{:keys [symbol parent path]}
-                           (param-paths param)
-                           parent-symbol
-                           ((param-paths parent) :symbol)]]
-                 [symbol (create-get-in-exp parent-symbol path)]))
+        new-params (mapcat #(create-get-in-binding param-paths %)
+                           bind-here)
         result-form (if (empty? new-params) inner-form
                       `(let [~@new-params] ~inner-form))]
     [result-form still-unbound]))
 
-(defn create-for-expression
+(defn- create-for-expression
   [iter-params sub-form param-paths dont-bind]
   (let [dont-bind-below
         (->> iter-params
@@ -256,11 +277,7 @@
                        (sort-by (comp :depth param-paths)))
 
         still-unbound (apply disj unbound-params bind-here)
-        make-binding
-        #(let [{:keys [symbol parent path]}
-               (param-paths %)
-               source ((param-paths parent) :symbol)]
-           [symbol (create-get-in-exp source path)])
+        make-binding (partial create-get-in-binding param-paths)
         make-bindings
         #(if ((param-paths (first %)) :list)
            (mapcat make-binding %)
@@ -271,15 +288,16 @@
         result-form `(for [~@iter-list] ~let-exp)]
     [result-form still-unbound]))
 
-(defn create-inner-form
+(defn- create-inner-form
   [form param-paths dont-bind]
   (assert (or (not (qualified? form))
               (contains? param-paths form))
           (str "Symbol " (dequalify-kw form)
                " not found in input format"))
   (cond
-    (qualified? form) [((param-paths form) :symbol)
-                       (set (traverse-dependencies param-paths form))]
+    (qualified? form)
+    [((param-paths form) :symbol)
+     (set (traverse-dependencies param-paths form))]
 
     ; [?for ?param] expressions
     (and (vector? form)
@@ -360,13 +378,12 @@
 
 (defn create-fn-expression [in-shape out-shape]
   (let [params-used (extract-bindings out-shape)
-        param-paths (extract-params in-shape params-used)
-        data-param ((param-paths ::data) :param)
-        data-sym ((param-paths ::data) :symbol)
+        [param-paths root] (extract-params in-shape params-used)
         [let-exp _]
-        (create-let-expression out-shape param-paths #{data-param})]
+        (create-let-expression out-shape param-paths
+                               #{(root :param)})]
     (pprint param-paths)
-    (list 'fn [data-sym] let-exp)))
+    (list 'fn [(root :symbol)] let-exp)))
 
 (defmacro precompile [in-shape out-shape]
   (create-fn-expression (eval in-shape) (eval out-shape)))
