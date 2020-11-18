@@ -76,87 +76,34 @@
                                    "field2" ?val}]}))
            "{field1{field2}}"))))
 
-; extract bindings tests
-(deftest extract-flat-map
-  (testing "extract qualified symbols from a flat map"
-    (is (= (gf/extract-params (gf/qualify
-                                {"field1" ?val1
-                                 "field2" ?val2}))
-           {::gf/val1 ["field1"]
-            ::gf/val2 ["field2"]}))))
-
-(deftest extract-nested-map
-  (testing "extract qualified symbols from a nested map"
-    (is (= (gf/extract-params (gf/qualify
-                                {"field1" ?val1
-                                 "field2" {"field3" ?val2}}))
-           {::gf/val1 ["field1"]
-            ::gf/val2 ["field2" "field3"]}))))
-
-(deftest extract-list-param
-  (testing "extract qualified symbol within a vector"
-    (is (= (gf/extract-params (gf/qualify
-                                {"field1" ?val1
-                                 "field2" [?val2]}))
-           {::gf/val1 ["field1"]
-            ::gf/val2 ["field2" ::gf/list]}))))
-
-(deftest extract-as-symbol
-  (testing "extract qualified symbols from a nested map with ?as"
-    (is (= (gf/extract-params (gf/qualify
-                                {"field1" ?val1
-                                 "field2" {?as ?val2
-                                           "field3" ?val3}}))
-           {::gf/val1 ["field1"]
-            ::gf/val2 ["field2"]
-            ::gf/val3 ["field2" "field3"]}))))
-
-(deftest unique-symbol
-  (testing (str "extract-params should throw assertion error when"
-                " same symbol is used multiple times.")
-    (is (thrown? AssertionError
-                 (gf/extract-params (gf/qualify
-                                      {"field1" ?val1
-                                       "field2" ?val1}))))))
-
-(def flat-map-in-format
-  (gf/qualify {"field1" ?val1 "field2" ?val2}))
-(def flat-map-out-format
-  (gf/qualify {:field1 ?val1 :field2 ?val2}))
-(def flat-map-convert-fn
-  (gf/precompile flat-map-in-format flat-map-out-format))
-(def flat-map-input-data {"field1" 1 "field2" 2})
-(def flat-map-expected-output {:field1 1 :field2 2})
 (deftest convert-flat-map
   (testing "convert flat data from flat format to flat format"
-    (is (= (flat-map-convert-fn flat-map-input-data)
-           flat-map-expected-output))))
+    (let [in-format (gf/qualify {"field1" ?val1 "field2" ?val2})
+          out-format (gf/qualify {:field1 ?val1 :field2 ?val2})
+          converter (gf/converter in-format out-format)
+          input {"field1" 1 "field2" 2}
+          expected {:field1 1 :field2 2}]
+      (is (= (converter input) expected)))))
 
-(def nested->flat-in-format
-  (gf/qualify {"field1" ?val1 "field2" {"field3" ?val2}}))
-(def nested->flat-out-format
-  (gf/qualify {?val1 ?val2}))
-(def nested->flat-convert-fn
-  (gf/precompile nested->flat-in-format nested->flat-out-format))
-(def nested->flat-input-data {"field1" 1 "field2" {"field3" 2}})
-(def nested->flat-expected-output {1 2})
 (deftest convert-nested->flat
   (testing "convert nested data to a flat format"
-    (is (= (nested->flat-convert-fn nested->flat-input-data)
-           nested->flat-expected-output))))
+    (let [in-format (gf/qualify {"field1" ?val1
+                                 "field2" {"field3" ?val2}})
+          out-format (gf/qualify {?val1 ?val2})
+          converter (gf/converter in-format out-format)
+          input {"field1" 1 "field2" {"field3" 2}}
+          expected {1 2}]
+      (is (= (converter input) expected)))))
 
-(def nested-map-in-format
-  (gf/qualify {"field1" ?val1 "field2" {"field3" ?val2}}))
-(def nested-map-out-format
-  (gf/qualify {:a ?val1 :b {:c ?val2}}))
-(def nested-map-convert-fn
-  (gf/precompile nested-map-in-format nested-map-out-format))
-(def nested-map-input-data {"field1" 1 "field2" {"field3" 2}})
-(def nested-map-expected-output {:a 1 :b {:c 2}})
 (deftest convert-nested-map
   (testing "convert nested data to a nested format"
-    (is (= (nested-map-convert-fn nested-map-input-data)
-           nested-map-expected-output))))
+    (let [in-format (gf/qualify {"field1" ?val1
+                                 "field2" {"field3" ?val2}})
+          out-format (gf/qualify {:a ?val1 :b {:c ?val2}})
+          converter (gf/converter in-format out-format)
+          input {"field1" 1 "field2" {"field3" 2}}
+          expected {:a 1 :b {:c 2}}]
+      (is (= (converter input) expected)))))
 
 (deftest convert-detect-unbinded-param
   (testing "convert format should contain no unbinded parameter"
@@ -217,8 +164,7 @@
                                 ?name ?value})
         data {"entries" [{"name" "a", "value" 1}
                          {"name" "b", "value" 2}]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected {"a" 1, "b" 2}]
     (testing "convert with parameters binded to multiple values in map"
       (is (= (converter data) expected)))))

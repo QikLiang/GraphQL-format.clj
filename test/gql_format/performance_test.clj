@@ -9,19 +9,23 @@
               {"field" field
                "subfields"
                (into [] (for [subfield (range 50)]
-                          {"name" (str subfield)
-                           "value" subfield}))}))})
+                          (assoc-in {}
+                                    ["key1" "key2" "key3" "key4"]
+                                    {"name" (str subfield)
+                                     "value" subfield})))}))})
 (def input-format
-  (gf/qualify {"form" [{"field" ?field
-                        "subfields" [{"name" ?name
-                                      "value" ?value}]}]}))
+  (gf/qualify {"form"
+               [{"field" ?field
+                 "subfields"
+                 [(assoc-in {}
+                            ["key1" "key2" "key3" "key4"]
+                            {"name" ?name
+                             "value" ?value})]}]}))
 (def output-format
   (gf/qualify [?for [?field ?name ?value]
                {:field ?field
                 :name ?name
                 :value ?value}]))
-
-(def converter (gf/precompile input-format output-format))
 
 ; prevent potential compile-time in-lining
 (def t1 (new java.util.Date))
@@ -30,7 +34,9 @@
 (def evaluator
   (let [in (if (.before t1 t2) input-format nil)
         out output-format]
-    (eval (gf/create-fn-expression in out))))
+    (gf/converter in out)))
+
+(def converter (gf/precompile input-format output-format))
 
 (defn convert [] (converter data))
 (defn evaluate [] (evaluator data))
@@ -39,8 +45,11 @@
   (into []
           (mapcat (fn [{field "field"
                         subfields "subfields"}]
-                    (for [{n "name" v "value"} subfields]
-                      {:field field :name n :value v})))
+                    (for [s subfields]
+                      (let [{n "name" v "value"}
+                            (get-in s
+                                    ["key1" "key2" "key3" "key4"])]
+                        {:field field :name n :value v}))))
           (data "form")))
 
 (deftest performance
