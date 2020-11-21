@@ -1,6 +1,7 @@
 (ns gql-format.core
   (:require [clojure.walk :refer [walk postwalk]]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.pprint :refer [pprint]]))
 
 ; prefix namespace used to ensure keywords are unique
 (def prefix (str (ns-name *ns*)))
@@ -157,7 +158,9 @@
           children (mapcat first sub-results)
           other-dependents (mapcat second sub-results)]
       (cond
-        (empty? children) [[] []] ; no dependents
+        (and (not (contains? form ::as)) ; no binding to self
+             (empty? children)) ; and no dependents
+        [[] []] ; return empty
         ; in-line current node if only used by one child
         (and (= 1 (count children))
              (some? parent) ; don't in-line root
@@ -174,24 +177,34 @@
                  :depth depth}]
                (concat children other-dependents)]))
 
-    (and (vector? form) (= (first form) ::as))
-    (let [actual-form (vec (drop 2 form))
-          param (second form)
-          [[self] children]
-          (extract-dependencies actual-form parent edge
-                                params-used depth)]
-      [[(assoc self :symbol (gensym (dequalify-kw param)))]
-       children])
-
     ; current form is an array of values
     (vector? form)
-    (let [[[{:keys [param symbol]}] other-dependents]
-          (extract-dependencies (first form) nil ::list
-                                params-used (inc depth))]
-      (assert (= 1 (count form))
-              (str "Expect vectors in GraphQL queries to contain"
-                   " exactly one kind of elements, but multiple"
-                   " were found in " form))
+    (let [[sub-form as-param]
+          (loop [as-param nil [form1 form2 & form-rest] form]
+            (cond
+              (= form1 ::as) (recur form2 form-rest)
+              (and (keyword? form1) (not (qualified? form1)))
+              (recur as-param form-rest)
+              :else [form1 as-param]))
+          [[{:keys [param symbol]}] other-dependents]
+          (extract-dependencies
+            (if (and (map? sub-form) (some? as-param))
+              (assoc sub-form ::as as-param)
+              sub-form)
+            nil ::list params-used (inc depth))
+          sub-as-param (when (map? sub-form) (sub-form ::as))
+          sub-param (when (qualified? sub-form) sub-form)]
+      (assert (not (vector? sub-form))
+              "Do not expect immediately nested lists in GraphQL queries")
+      (doseq [[p1 p2] [[as-param sub-as-param]
+                       [as-param sub-param]
+                       [sub-param sub-as-param]]]
+        (assert (or (nil? p1) (nil? p2))
+              (str "Input format can't have "
+                   (dequalify-kw p1)
+                   " and " (dequalify-kw p2)
+                   " both refer to the same value")))
+
       (assert (not= edge ::as)
               (str "Expect ?as to bind to a parameter, but "
                    form " found instead"))
@@ -264,6 +277,8 @@
 
 (defn- create-for-expression
   [iter-params sub-form param-paths dont-bind]
+  (assert (seq iter-params)
+          "?for expressions can't have no iterative parameters")
   (let [dont-bind-below
         (->> iter-params
              (mapcat (partial traverse-dependencies param-paths))
@@ -288,6 +303,11 @@
                           (partition-by (comp :list param-paths)
                                         bind-here))
         result-form `(for [~@iter-list] ~let-exp)]
+    (assert (seq bind-here)
+            (str "Parameter" (when (> (count iter-list) 1) \s)
+                 \space (str/join ", " iter-list)
+                 " don't result in any iteration in ?for "
+                 "expressions"))
     [result-form still-unbound]))
 
 (defn- create-inner-form
@@ -369,11 +389,12 @@
     ; recursively traverse ordinary data structures
     :else
     (let [recursive-result
-          (walk #(create-inner-form
-                   % param-paths dont-bind)
+          (walk #(create-inner-form % param-paths dont-bind)
                 identity form)
           result (walk first identity recursive-result)
-          params (if (seqable? recursive-result)
+          ; if walk above did work, then there could be params
+          ; to be extracted, else nothing
+          params (if (not= result recursive-result)
                    (set (mapcat second recursive-result))
                    #{})]
       [result params])))
@@ -390,4 +411,5 @@
   (create-fn-expression (eval in-shape) (eval out-shape)))
 
 (defn converter [in-shape out-shape]
+  (pprint (create-fn-expression in-shape out-shape))
   (eval (create-fn-expression in-shape out-shape)))
