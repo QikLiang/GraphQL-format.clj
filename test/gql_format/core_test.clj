@@ -123,6 +123,15 @@
     (testing "convert to a vector container"
       (is (= (converter data) expected)))))
 
+(deftest convert-list-binding-lazy
+  (let [in-format (gf/qualify {"field1" ?v1 "field2" [?v2]})
+        out-format (gf/qualify [?for-lazy [?v2] ?v2])
+        data {"field1" 1 "field2" [2 3 4]}
+        converter (gf/converter in-format out-format)
+        expected [2 3 4]]
+    (testing "convert to a lazy sequence"
+      (is (= (converter data) expected)))))
+
 (deftest convert-list-iterative-multiple-binding
   (let [in-format (gf/qualify {"field1" ?v1 "field2" [?v2]})
         out-format (gf/qualify [?for [?v2] ?v1 ?v2])

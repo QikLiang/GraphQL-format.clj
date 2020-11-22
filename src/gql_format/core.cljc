@@ -124,7 +124,11 @@
   [form]
   (cond
     (seqable? form) (set (mapcat extract-bindings form))
-    (and (qualified? form) (not= form ::for)) #{form}
+
+    (and (qualified? form)
+         (not (contains? #{::for ::for-lazy} form)))
+    #{form}
+
     :else #{}))
 
 (defn extract-dependencies
@@ -323,36 +327,40 @@
 
     ; [?for ?param] expressions
     (and (vector? form)
-         (= (qualify ?for) (first form))
+         (contains? #{::for ::for-lazy} (first form))
          (= (count form) 2))
     (let [list-params [(second form)]
           sub-form (second form)
           [for-exp params-used]
           (create-for-expression list-params sub-form
                                  param-paths dont-bind)]
-      [`(vec ~for-exp) params-used])
+      [(if (= ::for-lazy (first form)) for-exp `(vec ~for-exp))
+       params-used])
 
     ; [?for [?params] sub-form] expressions
     (and (vector? form)
-         (= (qualify ?for) (first form))
+         (contains? #{::for ::for-lazy} (first form))
          (= (count form) 3))
     (let [list-params (second form)
           sub-form (last form)
           [for-exp params-used]
           (create-for-expression list-params sub-form
                                  param-paths dont-bind)]
-      [`(vec ~for-exp) params-used])
+      [(if (= ::for-lazy (first form)) for-exp `(vec ~for-exp))
+       params-used])
 
     ; [?for [?params] sub-form1 sub-form2 ...] expressions
     (and (vector? form)
-         (= (qualify ?for) (first form))
+         (contains? #{::for ::for-lazy} (first form))
          (> (count form) 3))
     (let [list-params (second form)
           sub-form (vec (drop 2 form))
           [for-exp params-used]
           (create-for-expression list-params sub-form
-                                 param-paths dont-bind)]
-      [`(vec (apply concat ~for-exp)) params-used])
+                                 param-paths dont-bind)
+          exp `(apply concat ~for-exp)]
+      [(if (= ::for-lazy (first form)) exp `(vec ~exp))
+       params-used])
 
     ; #{?for ?param} expressions
     (and (set? form)
