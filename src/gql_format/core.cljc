@@ -1,7 +1,6 @@
 (ns gql-format.core
   (:require [clojure.walk :refer [walk postwalk]]
-            [clojure.string :as str]
-            [clojure.pprint :refer [pprint]]))
+            [clojure.string :as str]))
 
 ; prefix namespace used to ensure keywords are unique
 (def prefix (str (ns-name *ns*)))
@@ -243,7 +242,8 @@
   "Generate the list of all nodes from the specified node up
    to the root."
   [graph param]
-  (take-while some? (iterate (comp :parent graph) param)))
+  (take-while (comp some? :parent graph)
+              (iterate (comp :parent graph) param)))
 
 (defn- create-get-in-binding [graph param]
   (let [{self :symbol path :path parent :parent} (graph param)
@@ -399,17 +399,48 @@
                    #{})]
       [result params])))
 
-(defn create-fn-expression [in-shape out-shape]
+(defn check-path-reachable [path data]
+  (cond
+    (empty? path) true
+    (= ::list (first path))
+    (and (vector? data)
+         (or (empty? data)
+             (recur (rest path) (first data))))
+    :else
+    (and (map? data)
+         (contains? data (first path))
+         (recur (rest path) (data (first path))))))
+
+(defn- generate-asserts [params-graph data-sym]
+  (for [[param _]
+        (sort-by (comp :depth second) params-graph)
+        :when (-> param params-graph :parent some?)]
+    (let [params (traverse-dependencies params-graph param)
+          nodes (map params-graph (reverse params))
+          path (mapcat (fn [{is-list :list path :path}]
+                         (if is-list (concat path [::list]) path))
+                       nodes)]
+      `(assert (check-path-reachable [~@path] ~data-sym)
+               ~(str "Parameter " (dequalify-kw param)
+                     " not reachable")))))
+
+(defn create-fn-expression [in-shape out-shape gen-asserts]
   (let [params-used (extract-bindings out-shape)
         [param-paths root] (extract-params in-shape params-used)
         [let-exp _]
         (create-let-expression out-shape param-paths
                                #{(root :param)})]
-    (list 'fn [(root :symbol)] let-exp)))
+    `(fn [~(root :symbol)]
+       ~@(if gen-asserts
+           (generate-asserts param-paths (root :symbol))
+           [])
+       ~let-exp)))
+
+(def gen-asserts (atom false))
 
 (defmacro precompile [in-shape out-shape]
-  (create-fn-expression (eval in-shape) (eval out-shape)))
+  (create-fn-expression (eval in-shape) (eval out-shape)
+                        @gen-asserts))
 
 (defn converter [in-shape out-shape]
-  (pprint (create-fn-expression in-shape out-shape))
-  (eval (create-fn-expression in-shape out-shape)))
+  (eval (create-fn-expression in-shape out-shape @gen-asserts)))

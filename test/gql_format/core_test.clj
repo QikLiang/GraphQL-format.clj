@@ -4,6 +4,7 @@
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
+(reset! gf/gen-asserts true)
 
 ; qualify tests
 (deftest simple-qualifier
@@ -110,14 +111,14 @@
     (is (thrown? AssertionError
                  (gf/create-fn-expression
                    (gf/qualify {"field1" ?v1})
-                   (gf/qualify ?v2))))))
+                   (gf/qualify ?v2)
+                   false)))))
 
 (deftest convert-list-binding
   (let [in-format (gf/qualify {"field1" ?v1 "field2" [?v2]})
         out-format (gf/qualify [?for [?v2] ?v2])
         data {"field1" 1 "field2" [2 3 4]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected [2 3 4]]
     (testing "convert to a vector container"
       (is (= (converter data) expected)))))
@@ -126,8 +127,7 @@
   (let [in-format (gf/qualify {"field1" ?v1 "field2" [?v2]})
         out-format (gf/qualify [?for [?v2] ?v1 ?v2])
         data {"field1" 1 "field2" [2 3 4]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected [1 2 1 3 1 4]]
     (testing "convert with multiple parameters binded to multiple values"
       (is (= (converter data) expected)))))
@@ -136,8 +136,7 @@
   (let [in-format (gf/qualify {"field1" ?v1 "field2" [?v2]})
         out-format (gf/qualify [?for ?v2])
         data {"field1" 1 "field2" [2 3 4]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected [2 3 4]]
     (testing "convert to vector with shorthand notation"
       (is (= (converter data) expected)))))
@@ -173,8 +172,7 @@
   (let [in-format (gf/qualify {"field1" ?v1 "field2" [?v2]})
         out-format (gf/qualify #{?for ?v2})
         data {"field1" 1 "field2" [2 3 4]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected #{2 3 4}]
     (testing "bind multiple values to a set"
       (is (= (converter data) expected)))))
@@ -187,8 +185,7 @@
         data {"field1" 1 "field2" [{"val1" "v1a", "val2" "v2a"}
                                    {"val1" "v1b", "val2" "v2b"}
                                    {"val1" "v1c", "val2" "v2c"}]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected #{"v1a" "v2a" "v1b" "v2b" "v1c" "v2c"}]
     (testing "bind multiple parameters in a set"
       (is (= (converter data) expected)))))
@@ -206,8 +203,7 @@
                         {"list" "cat2"
                          "sublist" ["subcat1"
                                     "subcat2"]}]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected [["cat1" ["subcat1" "subcat2"]]
                   ["cat2" ["subcat1" "subcat2"]]]]
     (testing "convert parameter binded to multiple values"
@@ -217,8 +213,16 @@
   (let [in-format (gf/qualify {"values" [?vals]})
         out-format (gf/qualify `(reduce + ?vals))
         data {"values" [1 2 3 4]}
-        converter (eval (gf/create-fn-expression
-                          in-format out-format))
+        converter (gf/converter in-format out-format)
         expected 10]
     (testing "convert parameter binded to multiple values"
       (is (= (converter data) expected)))))
+
+(deftest converter-trigger-assert
+  (let [in-format (gf/qualify {"values" [?vals]})
+        out-format (gf/qualify `(reduce + ?vals))
+        data {"values" 1}
+        converter (gf/converter in-format out-format)]
+    (testing "Assert should fail when expecting list and not found"
+      (is (thrown? AssertionError
+                   (converter data))))))
